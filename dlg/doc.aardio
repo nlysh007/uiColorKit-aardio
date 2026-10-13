@@ -1,0 +1,19 @@
+//Markdown 窗口控件
+import fonts.fontAwesome;
+import win.ui;
+/*DSG{{*/
+var winform = win.form(text="message文档";right=759;bottom=469)
+winform.add()
+/*}}*/
+
+import web.form.simpleMarkdown;
+var wb = web.form.simpleMarkdown(winform);
+
+
+wb.enableKatex(true);
+
+wb.write(string.load("\readme.md"));
+
+win.loopMessage(); 
+winform.show();
+return winform;

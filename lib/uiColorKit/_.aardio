@@ -1,0 +1,30 @@
+/*
+	uiColorKit — 颜色格式、选择器与输入控件
+
+	公共 API 按职责放在子库：
+	  uiColorKit.format
+	  uiColorKit.picker
+	  uiColorKit.input
+
+	用法：
+		import uiColorKit;
+		var color = uiColorKit.format.parse("oklch(0.628 0.258 29.2)");
+		var picker = uiColorKit.picker.create(winform.picker,{color=color});
+*/
+import uiColorKit.format;
+import uiColorKit.picker;
+import uiColorKit.input;
+
+namespace uiColorKit;
+
+
+format = ..uiColorKit.format;
+picker = ..uiColorKit.picker;
+input = ..uiColorKit.input;
+
+/**intellisense()
+uiColorKit = 颜色格式与颜色控件扩展库，颜色值统一为 0xAARRGGBB
+uiColorKit.format = CSS Color 4 解析、格式化与色彩空间转换
+uiColorKit.picker = plus 自绘颜色选择器
+uiColorKit.input = plus 自绘颜色输入控件
+end intellisense**/

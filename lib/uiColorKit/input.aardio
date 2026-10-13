@@ -1,0 +1,851 @@
+/*
+	uiColorKit.input — plus 自绘颜色输入组件
+
+	交互：
+	  1. 点击输入框 → 弹出颜色选择器（orphanWindow 悬浮层）
+	  2. 点击选择器外部（主窗体）→ 关闭并 onCommit 提交颜色
+	  3. 再点输入框 → 关闭
+*/
+import win.ui;
+import win.region;
+import gdip;
+import gdip.solidBrush;
+import gdip.pen;
+import gdip.path;
+import uiColorKit.picker;
+import uiColorKit.format;
+import sys.monitor;
+
+namespace uiColorKit.input;
+// ============================================================
+// 私有工具 / 主题
+// ============================================================
+var num = function(value, defaultValue){
+	if(type(value) == type.number) return value;
+	return defaultValue;
+};
+var floor = ..math.floor;
+var u32 = ..uiColorKit.format.parse;
+var alphaOf = lambda(color) ..math.floor(..uiColorKit.format.getAlpha(color) * 255 + 0.5);
+var rgbOf = ..uiColorKit.format.getRgbValue;
+var withAlpha = lambda(color,alpha) ..uiColorKit.format.setAlpha(color,alpha / 255);
+
+themes = {
+	dark = {
+		name = "dark";
+		bg = 0xFF2B2D38;
+		bgHover = 0xFF343848;
+		bgActive = 0xFF23252E;
+		border = 0xFF424658;
+		borderFocus = 0xFF6B9CFF;
+		text = 0xFFF2F4F8;
+		chevron = 0xFF9AA0A6;
+		checkerA = 0xFF2A2C34;
+		checkerB = 0xFF3A3D48;
+	};
+	light = {
+		name = "light";
+		bg = 0xFFFFFFFF;
+		bgHover = 0xFFF7F8FA;
+		bgActive = 0xFFEEF0F4;
+		border = 0xFFE5E7EB;
+		borderFocus = 0xFF3B82F6;
+		text = 0xFF1F2329;
+		chevron = 0xFF6B7280;
+		checkerA = 0xFFE8EAED;
+		checkerB = 0xFFF7F8FA;
+	};
+};
+
+var resolveTheme = function(theme){
+	if(theme === null) return ..table.assign({},themes.dark);
+	if(type(theme) == type.string){
+		return ..table.assign({},themes[theme] : themes.dark);
+	}
+	if(type(theme) == type.table){
+		return ..table.assign({},themes[theme.name] : themes.dark,theme);
+	}
+	return ..table.assign({},themes.dark);
+};
+
+var Helpers = {};
+var H = Helpers;
+
+Helpers.normalizeOptions = function(opt){
+	var o = opt : {};
+	var color = o.color;
+	// 仅 null 视为未传；0x00000000 合法，禁止 a:b 吞 0
+	if(color === null) color = 0xFF3B82F6;
+	if(type(color) == type.string){
+		var pc = ..uiColorKit.format.parse(color);
+		if(pc !== null) color = pc;
+		else color = 0xFF3B82F6;
+	}
+	if(type(color) != type.number) color = 0xFF3B82F6;
+	color = u32(color);
+	if(alphaOf(color) == 0 && rgbOf(color) != 0){
+		color = 255 * 0x1000000 + rgbOf(color);
+	}
+	// 0x00000000：showAlpha 时保留透明黑，否则补不透明
+	if(color === 0){
+		var wantAlpha = true;
+		if(o.showAlpha === false || o.showAlpha === 0) wantAlpha = false;
+		if(wantAlpha) color = 0x00000000;
+		else color = 0xFF000000;
+	}
+	// 布尔建表后赋值，避免 false 在表构造里被丢掉
+	var out = {
+		theme = resolveTheme(o.theme);
+		colorMode = o.colorMode : "hex";
+		radius = num(o.radius, 8);
+		fontName = o.fontName : "Microsoft YaHei UI";
+		fontSize = num(o.fontSize, 13);
+		popupWidth = num(o.popupWidth, 320);
+		popupHeight = num(o.popupHeight, 380);
+	};
+	// draw=false 仅关闭 InputView 的自绘，保留绑定、交互、键盘和 PickerView。
+	// noDraw=true 是兼容别名；默认仍绘制完整输入外观。
+	out.draw = true;
+	if(o.draw === false || o.draw === 0 || o.noDraw === true || o.noDraw === 1) out.draw = false;
+	out.onDraw = o.onDraw;
+	out.color = color;
+	out.showAlpha = true;
+	if(o.showAlpha === false || o.showAlpha === 0) out.showAlpha = false;
+	if(!out.showAlpha) out.color = 0xFF000000 + rgbOf(out.color);
+	return out;
+};
+
+// 均匀圆角描边环：外圆角 − 内圆角（Alternate 填充），厚度恒为 bw
+// 比 drawRoundRect 抗锯齿描边更匀（后者圆角与直线段覆盖不一致）
+var strokeRing = function(graphics, x, y, w, h, radius, bw, borderColor){
+	if(w < 4 || h < 4) return;
+	var t = bw;
+	if(t === null || t < 1) t = 1;
+	if(t * 2 >= w) t = 1;
+	if(t * 2 >= h) t = 1;
+	var r = radius;
+	if(r === null || r < 0) r = 0;
+	if(r > w / 2) r = w / 2;
+	if(r > h / 2) r = h / 2;
+	var ir = r - t;
+	if(ir < 0) ir = 0;
+	var path = ..gdip.path(0/*Alternate*/);
+	path.addRoundRect(x, y, w, h, r);
+	path.addRoundRect(x + t, y + t, w - t * 2, h - t * 2, ir);
+	var b = ..gdip.solidBrush(borderColor);
+	graphics.fillPath(b, path);
+	b.delete();
+	path.delete();
+};
+
+// ============================================================
+// 弹窗状态
+// ============================================================
+var UI = {
+	pop = null;
+	picker = null;
+	current = null;
+	opened = false;
+	closeTick = 0;
+	openTick = 0;
+	hostOrigDown = null;
+	busy = false;
+	attachedCount = 0;
+	applied = null;  // 上次套用到共享 picker 的配置
+};
+
+var hidePop = function(){
+	if(!UI.pop) return;
+	try {
+		UI.pop.hide = true;
+		if(UI.pop.hwnd) ::User32.ShowWindow(UI.pop.hwnd, 0/*_SW_HIDE*/);
+	}
+	catch(e){}
+};
+
+var unhookHost = function(){
+	if(UI.hostOrigDown){
+		var t = UI.current;
+		var host = t && t.ctrl ? (t.ctrl.getForm ? t.ctrl.getForm() : t.ctrl._parentForm) : null;
+		try {
+			if(host) host.onMouseDown = UI.hostOrigDown;
+		}
+		catch(e){}
+		UI.hostOrigDown = null;
+	}
+};
+
+var closePopup = function(commit){
+	// 防重入：hide 会再触发 onActivate
+	if(UI.busy) return;
+	UI.busy = true;
+	var t = UI.current;
+	UI.opened = false;
+	UI.current = null;
+	UI.closeTick = ..time.tick();
+
+	// 先解绑，再 hide，避免回调重入
+	try {
+		if(UI.picker){
+			UI.picker.onChange = null;
+			UI.picker.onCommit = null;
+		}
+		if(UI.pop){
+			UI.pop.onActivate = null;
+			UI.pop.onActivateApp = null;
+		}
+	}
+	catch(e){}
+	unhookHost();
+	hidePop();
+
+	if(t){
+		try {
+			if(commit !== false){
+				if(t.pendingColor !== null) t.color = t.pendingColor;
+				t.pendingColor = null;
+				if(t.onCommit) t.onCommit(t, t.color);
+			}
+			else {
+				t.pendingColor = null;
+			}
+			if(t.onClose) t.onClose(t, t.color);
+			if(t._redraw) t._redraw();
+		}
+		catch(e){}
+	}
+	UI.busy = false;
+};
+
+// ============================================================
+// 控件绑定
+// ============================================================
+var bindCtrl = function(t, ctrl){
+	if(!t.attached){
+		t.attached = true;
+		UI.attachedCount += 1;
+	}
+	t.ctrl = ctrl;
+	// uiColorKit.input 只支持 plus 控件。
+	// draw=false 仍绑定 plus 的交互，但不接管其绘制，也不修改其既有文字和样式。
+	if(t.opt.draw !== false){
+		ctrl.notify = true;
+		ctrl.transparent = true;
+		ctrl.cursor = "hand";
+		ctrl.tabstop = true;
+		ctrl.onDrawBackground = function(graphics, rc, bkColor, foreColor){
+			t.painting = true;
+			try {
+				t.paint(graphics, rc);
+			}
+			catch(e){}
+			t.painting = false;
+			return true;
+		};
+	}
+	elseif(t.onDraw){
+		// 无默认样式模式只调用用户绘制回调，不修改 plus 的既有外观。
+		ctrl.onDrawBackground = function(graphics, rc, bkColor, foreColor){
+			t.painting = true;
+			try {
+				t.onDraw(graphics, rc, t);
+			}
+			catch(e){}
+			t.painting = false;
+			return true;
+		};
+	}
+
+	// plus 控件统一使用鼠标事件，不兼容 button/oncommand 等其他 ctrl 分支。
+	ctrl.onMouseDown = function(wParam, lParam){
+		if(..time.tick() - UI.closeTick < 300) return;
+		if(UI.opened) closePopup(true);
+		else t.open();
+	};
+
+	if(t.opt.draw !== false){
+		ctrl.onMouseMove = function(wParam, lParam){
+			if(!t.hover){
+				t.hover = true;
+				t._redraw();
+			}
+		};
+
+		ctrl.onMouseLeave = function(wParam, lParam){
+			if(t.hover){
+				t.hover = false;
+				t._redraw();
+			}
+		};
+	}
+
+	ctrl.onKeyDown = function(key, msg){
+		if(key == 13 || key == 32){
+			if(..time.tick() - UI.closeTick < 300) return;
+			if(UI.opened) closePopup(true);
+			else t.open();
+		}
+		elseif(key == 27 && UI.opened){
+			closePopup(false);
+		}
+	};
+};
+
+// ============================================================
+// 主类
+// ============================================================
+var class inputView{
+	ctor(ctrl, options){
+		this.ctrl = null;
+		this.attached = false;
+		this.painting = false;
+		this.redrawing = false;
+		this.hover = false;
+		this.pendingColor = null;
+		this.fontsReady = false;
+		this.font = null;
+		this.fmtLeft = null;
+
+		var raw = H.normalizeOptions(options);
+		// 布尔字段建表后赋值，避免 false 被表构造丢掉
+		this.opt = {
+			theme = raw.theme;
+			colorMode = raw.colorMode;
+			radius = raw.radius;
+			fontName = raw.fontName;
+			fontSize = raw.fontSize;
+			popupWidth = raw.popupWidth;
+			popupHeight = raw.popupHeight;
+		};
+		this.opt.draw = raw.draw;
+		this.opt.showAlpha = true;
+		if(raw.showAlpha === false || raw.showAlpha === 0) this.opt.showAlpha = false;
+		this.color = raw.color;
+		this.onChange = null;
+		this.onCommit = null;
+		this.onOpen = null;
+		this.onClose = null;
+		// draw=false 时可选的自定义绘制回调：onDraw(graphics, rc, view)
+		this.onDraw = raw.onDraw;
+
+		if(ctrl) bindCtrl(this, ctrl);
+	}
+
+	attach = function(ctrl){
+		var t = owner;
+		bindCtrl(t, ctrl);
+		return t;
+	};
+
+	getColor = function(){
+		return owner.color;
+	};
+
+	getHex = function(){
+		var t = owner;
+		var withA = false;
+		if(t.opt.showAlpha !== false && t.opt.showAlpha !== 0){
+			if(alphaOf(t.color) < 255) withA = true;
+		}
+		return ..uiColorKit.format.toHex(t.color, withA);
+	};
+
+	getRgb = function(){
+		return ..uiColorKit.format.getRgb(owner.color);
+	};
+
+	isOpen = function(){
+		return UI.opened && UI.current === owner;
+	};
+
+	setColor = function(color, silent){
+		var t = owner;
+		if(type(color) == type.string){
+			var pc = ..uiColorKit.format.parse(color);
+			if(pc === null) return t;
+			color = pc;
+		}
+		if(type(color) != type.number) return t;
+		color = u32(color);
+		t.color = color;
+		if(t.opt.showAlpha === false || t.opt.showAlpha === 0){
+			// 紧凑：忽略透明度
+			t.color = 0xFF000000 + ..uiColorKit.format.getRgbValue(color);
+		}
+		if(UI.picker && UI.current === t) UI.picker.setColor(t.color, true);
+		if(!silent && t.onChange) t.onChange(t, t.color);
+		t._redraw();
+		return t;
+	};
+
+	setHex = function(hex, silent){
+		return owner.setColor(hex, silent);
+	};
+
+	// 批量更新（showAlpha / colorMode / theme / 字体等）
+	setOptions = function(opt){
+		var t = owner;
+		if(!opt) return t;
+		if(opt.theme !== null) t.opt.theme = resolveTheme(opt.theme);
+		if(opt.showAlpha !== null){
+			t.opt.showAlpha = true;
+			if(opt.showAlpha === false || opt.showAlpha === 0) t.opt.showAlpha = false;
+			if(!t.opt.showAlpha) t.color = 0xFF000000 + ..uiColorKit.format.getRgbValue(t.color);
+		}
+		if(opt.colorMode !== null) t.opt.colorMode = opt.colorMode : "hex";
+		if(opt.radius !== null) t.opt.radius = num(opt.radius, 8);
+		if(opt.fontSize !== null){
+			t.opt.fontSize = num(opt.fontSize, 13);
+			t.fontsReady = false;
+		}
+		if(opt.fontName !== null){
+			t.opt.fontName = opt.fontName;
+			t.fontsReady = false;
+		}
+		if(opt.popupWidth !== null) t.opt.popupWidth = num(opt.popupWidth, 320);
+		if(opt.popupHeight !== null) t.opt.popupHeight = num(opt.popupHeight, 380);
+		if(opt.draw !== null || opt.noDraw !== null){
+			t.opt.draw = true;
+			if(opt.draw === false || opt.draw === 0 || opt.noDraw === true || opt.noDraw === 1) t.opt.draw = false;
+		}
+		if(opt.onDraw !== null) t.onDraw = opt.onDraw;
+		// draw/onDraw 动态变化时重新挂载 plus 绘制入口；不修改控件样式。
+		if(t.ctrl) bindCtrl(t, t.ctrl);
+		if(opt.color !== null) t.setColor(opt.color, true);
+		if(UI.picker && UI.current === t) t._syncPickerOptions();
+		t._redraw();
+		return t;
+	};
+
+	setTheme = function(theme){
+		var t = owner;
+		t.opt.theme = resolveTheme(theme);
+		// 共享弹窗在打开时才套用；若正打开则立刻同步
+		if(UI.picker && UI.current === t){
+			UI.picker.setTheme(t.opt.theme);
+			if(UI.applied) UI.applied.themeName = t.opt.theme.name : "dark";
+		}
+		t._redraw();
+		return t;
+	};
+
+	// 共享 picker：每次打开比对配置，变了才套用并重绘
+	_syncPickerOptions = function(){
+		var t = owner;
+		if(!UI.picker) return;
+		var th = t.opt.theme;
+		var thName = "dark";
+		if(th && th.name) thName = th.name;
+		var sa = 1;
+		if(t.opt.showAlpha === false || t.opt.showAlpha === 0) sa = 0;
+		var cm = t.opt.colorMode : "hex";
+		var last = UI.applied;
+		if(last && last.showAlpha == sa && last.colorMode == cm && last.themeName == thName){
+			return;
+		}
+		// 数值 1/0 传布尔，避免 false 在表构造里丢失
+		var opt = {
+			showHue = 1;
+			showInfo = 1;
+			colorMode = cm;
+		};
+		opt.showAlpha = sa;
+		UI.picker.setOptions(opt);
+		UI.picker.setTheme(th);
+		UI.applied = {
+			showAlpha = sa;
+			colorMode = cm;
+			themeName = thName;
+		};
+	};
+
+	// ---------- 打开：顶层窗体，失活即关 ----------
+	open = function(){
+		var t = owner;
+		if(!t.ctrl) return t;
+		if(UI.busy) return t;
+		if(UI.opened && UI.current === t) return t;
+		if(UI.opened) closePopup(true);
+		if(UI.busy) return t;
+		UI.busy = true;
+
+		var pw = t.opt.popupWidth;
+		var ph = t.opt.popupHeight;
+		var th = t.opt.theme;
+
+		// 复用或创建弹层：宿主 plus → orphanWindow 浮起
+		if(!UI.pop || !UI.pop.hwnd){
+			try {
+				var host = t.ctrl.getForm ? t.ctrl.getForm() : t.ctrl._parentForm;
+				if(!host){
+					UI.busy = false;
+					return t;
+				}
+				host.add(
+					cfColorPopup = {
+						cls = "plus";
+						left = 0; top = 0;
+						right = pw - 1; bottom = ph - 1;
+						notify = 1; tabstop = 1;
+						// picker 为 transparent 圆角，弹层铺主题 surface，四角不透出桌面
+						bgcolor = th.surface;
+						z = 9999;
+					}
+				);
+				UI.pop = host.cfColorPopup;
+				UI.pop.orphanWindow();
+				UI.picker = ..uiColorKit.picker.create(UI.pop, {
+					color = t.color;
+					theme = th.name : "dark";
+					showAlpha = t.opt.showAlpha;
+					showHue = true;
+					showInfo = true;
+					colorMode = t.opt.colorMode;
+					radius = 10;
+				});
+			}
+			catch(e){
+				UI.busy = false;
+				return t;
+			}
+		}
+
+		// 屏幕坐标定位 + 边缘避让
+		var sx = 20;
+		var sy = 80;
+		var fx = 20;
+		var fy = 80;
+		var fw = 100;
+		var fh = 36;
+		if(t.ctrl.getRect){
+			var rc = t.ctrl.getRect(true/*屏幕坐标*/);
+			fx = rc.left; fy = rc.top; fw = rc.width; fh = rc.height;
+		}
+		elseif(t.ctrl.hwnd){
+			var wr = ::RECT();
+			if(::GetWindowRect(t.ctrl.hwnd, wr)){
+				fx = wr.left; fy = wr.top;
+				fw = wr.right - wr.left; fh = wr.bottom - wr.top;
+			}
+		}
+		// 默认贴字段下沿
+		sx = fx;
+		sy = fy + fh + 4;
+
+		// 使用字段所在显示器的工作区，支持副屏和负坐标布局。
+		var monitorInfo = ..sys.monitor.getInfoFromPoint(fx + fw / 2, fy + fh / 2);
+		var wa = monitorInfo ? monitorInfo.rcWork : null;
+		if(!wa){
+			wa = ::RECT(0, 0,
+				::User32.GetSystemMetrics(0/*_SM_CXSCREEN*/),
+				::User32.GetSystemMetrics(1/*_SM_CYSCREEN*/)
+			);
+		}
+		if(sy + ph > wa.bottom){
+			var up = fy - ph - 4;
+			if(up >= wa.top) sy = up;
+			else sy = wa.bottom - ph;
+		}
+		if(sx + pw > wa.right) sx = wa.right - pw;
+		if(sx < wa.left) sx = wa.left;
+		if(sy < wa.top) sy = wa.top;
+		if(sy + ph > wa.bottom) sy = wa.bottom - ph;
+
+		if(UI.pop.setPos) UI.pop.setPos(sx, sy, pw, ph);
+
+		// CreateRoundRectRgn 的右、下边界不包含在区域内，需要各加 1，避免裁掉边框。
+		if(UI.pop.hwnd){
+			var rgn = ::CreateRoundRectRgn(0, 0, pw + 1, ph + 1, 20, 20);
+			if(rgn){
+				::SetWindowRgn(UI.pop.hwnd, rgn, true);
+				// SetWindowRgn 接管句柄
+			}
+		}
+
+		UI.picker.setColor(t.color, true);
+		t._syncPickerOptions();
+		UI.picker.onChange = function(v, color){
+			t.pendingColor = color;
+			t.color = color;
+			t._redraw();
+			if(t.onChange) t.onChange(t, color);
+		};
+		UI.picker.onCommit = function(v, color){
+			t.pendingColor = color;
+		};
+
+		UI.current = t;
+		UI.opened = true;
+		UI.openTick = ..time.tick();
+
+		// 顶层弹窗失活（切到其他窗口或主窗体子控件）时提交并关闭。
+		UI.pop.onActivate = function(state){
+			if(!state && UI.opened && ..time.tick() - UI.openTick > 100) closePopup(true);
+		};
+		UI.pop.onActivateApp = function(state){
+			if(!state && UI.opened) closePopup(true);
+		};
+
+		// 点主窗体（弹层外）→ 关闭
+		// 不要 onFocusLost：点选择器里的 HEX/RGB 输入会抢焦点，会误关
+		if(!UI.hostOrigDown && t.ctrl){
+			var host2 = t.ctrl.getForm ? t.ctrl.getForm() : t.ctrl._parentForm;
+			if(host2){
+				UI.hostOrigDown = host2.onMouseDown;
+				host2.onMouseDown = function(wParam, lParam){
+					if(..time.tick() - UI.openTick < 350 || ..time.tick() - UI.closeTick < 300){
+						if(UI.hostOrigDown) return UI.hostOrigDown(wParam, lParam);
+						return;
+					}
+					if(UI.opened) closePopup(true);
+					if(UI.hostOrigDown) return UI.hostOrigDown(wParam, lParam);
+				};
+			}
+		}
+
+		if(UI.picker.redraw) UI.picker.redraw();
+		if(UI.pop.show) UI.pop.show();
+		if(UI.pop.hwnd) ::UpdateWindow(UI.pop.hwnd);
+		if(UI.picker.redraw) UI.picker.redraw();
+		if(UI.pop.setFocus) UI.pop.setFocus();
+
+		if(t.onOpen) t.onOpen(t, t.color);
+		t._redraw();
+		UI.busy = false;
+		return t;
+	};
+
+	close = function(commit){
+		var t = owner;
+		if(UI.current === t) closePopup(commit !== false);
+		return t;
+	};
+
+	dispose = function(){
+		var t = owner;
+		if(UI.current === t) closePopup(false);
+		if(t.font) t.font.delete();
+		if(t.fmtLeft) t.fmtLeft.delete();
+		t.font = null;
+		t.fmtLeft = null;
+		t.fontsReady = false;
+		if(t.ctrl){
+			t.ctrl.onDrawBackground = null;
+			t.ctrl.onMouseDown = null;
+			t.ctrl.onMouseMove = null;
+			t.ctrl.onMouseLeave = null;
+			t.ctrl.onKeyDown = null;
+		}
+		t.ctrl = null;
+		if(t.attached){
+			t.attached = false;
+			UI.attachedCount -= 1;
+			if(UI.attachedCount < 0) UI.attachedCount = 0;
+		}
+		// 最后一个可视 input 释放时，同时释放共享弹层及 picker 缓存。
+		if(UI.attachedCount == 0 && UI.pop){
+			if(UI.opened) closePopup(false);
+			if(UI.picker) UI.picker.dispose();
+			UI.picker = null;
+			UI.pop.onActivate = null;
+			UI.pop.onActivateApp = null;
+			if(UI.pop.destroy) UI.pop.destroy();
+			elseif(UI.pop.close) UI.pop.close();
+			UI.pop = null;
+			UI.current = null;
+			UI.opened = false;
+			UI.applied = null;
+		}
+		return t;
+	};
+
+	redraw = function(){
+		return owner._redraw();
+	};
+
+	refresh = function(){
+		return owner._redraw();
+	};
+
+	paint = function(graphics, rc){
+		if(!graphics) return;
+		owner.painting = true;
+		owner._paint(graphics, rc);
+		owner.painting = false;
+		return true;
+	};
+
+	_redraw = function(){
+		var t = owner;
+		if(t.ctrl && (t.opt.draw !== false || t.onDraw) && !t.painting && !t.redrawing){
+			t.redrawing = true;
+			try {
+				t.ctrl.redrawTransparent();
+			}
+			catch(e){}
+			t.redrawing = false;
+		}
+	};
+
+	_ensureFonts = function(){
+		var t = owner;
+		if(t.fontsReady) return;
+		if(t.font) t.font.delete();
+		if(t.fmtLeft) t.fmtLeft.delete();
+		t.font = ..gdip.font(t.opt.fontName, t.opt.fontSize, 0, 2);
+		t.fmtLeft = ..gdip.stringFormat();
+		t.fmtLeft.align = 0;
+		t.fmtLeft.lineAlign = 1;
+		t.fmtLeft.trimming = 3;
+		t.fmtLeft.flags = 4096;
+		t.fontsReady = true;
+	};
+
+	_paint = function(graphics, rc){
+		var t = owner;
+		if(!graphics) return;
+		var cw = t.ctrl ? t.ctrl.clientWidth : 0;
+		var ch = t.ctrl ? t.ctrl.clientHeight : 0;
+		if(rc && (cw < 2 || ch < 2)){
+			var x0,y0,w0,h0 = rc.xywh();
+			cw = w0;
+			ch = h0;
+		}
+		if(cw < 2 || ch < 2) return;
+
+		graphics.smoothingMode = 4;
+		graphics.textRenderingHint = 4;
+		t._ensureFonts();
+
+		var th = t.opt.theme;
+		var radius = t.opt.radius;
+		var open = UI.opened && UI.current === t;
+
+		var bg = th.bg;
+		if(open) bg = th.bgActive;
+		elseif(t.hover) bg = th.bgHover;
+		var bb = ..gdip.solidBrush(bg);
+		if(radius > 0) graphics.fillRoundRect(bb, ..RECTF(0, 0, cw, ch), radius);
+		else graphics.fillRect(bb, 0, 0, cw, ch);
+		bb.delete();
+
+		// 均匀描边（不居中 drawRoundRect，避免圆角/直线粗细不一）
+		var borderColor = open ? th.borderFocus : th.border;
+		var bw = open ? 2 : 1;
+		if(radius > 0) strokeRing(graphics, 0, 0, cw, ch, radius, bw, borderColor);
+		else {
+			var bp = ..gdip.pen(borderColor, bw);
+			graphics.drawRect(bp, 0, 0, cw - 1, ch - 1);
+			bp.delete();
+		}
+
+		// 色块：棋盘只在圆角内，避免四角露出透明格
+		var chip = 22;
+		if(ch - 14 < chip) chip = ch - 14;
+		if(chip < 12) chip = 12;
+		var cx = 10;
+		var cy = (ch - chip) / 2;
+		var cr = 4;
+		var st = graphics.save();
+		var cpath = ..gdip.path();
+		cpath.addRoundRect(cx, cy, chip, chip, cr);
+		graphics.setClipPath(cpath);
+		cpath.delete();
+		var s = 4;
+		var c1 = ..gdip.solidBrush(th.checkerA);
+		var c2 = ..gdip.solidBrush(th.checkerB);
+		var cols = floor(chip / s) + 1;
+		var rows = floor(chip / s) + 1;
+		for(rr=0; rows-1; 1){
+			for(cc=0; cols-1; 1){
+				var brush = ((rr + cc) % 2 == 0) ? c1 : c2;
+				graphics.fillRect(brush, cx + cc * s, cy + rr * s, s + 1, s + 1);
+			}
+		}
+		c1.delete();
+		c2.delete();
+		var fill = ..gdip.solidBrush(t.color);
+		graphics.fillRoundRect(fill, ..RECTF(cx, cy, chip, chip), cr);
+		fill.delete();
+		graphics.restore(st);
+		strokeRing(graphics, cx, cy, chip, chip, cr, 1, th.border);
+
+		// HEX
+		var textX = cx + chip + 10;
+		var textW = cw - textX - 24;
+		if(textW < 20) textW = 20;
+		var brushT = ..gdip.solidBrush(th.text);
+		graphics.drawString(t.getHex(), t.font, ..RECTF(textX, 0, textW, ch), t.fmtLeft, brushT);
+		brushT.delete();
+
+		// 箭头
+		var ax = cw - 16;
+		var ay = ch / 2;
+		var ab = ..gdip.solidBrush(th.chevron);
+		if(open){
+			graphics.fillPolygon(ab, 0,
+				ax, ay - 3,
+				ax - 5, ay + 3,
+				ax + 5, ay + 3
+			);
+		}
+		else {
+			graphics.fillPolygon(ab, 0,
+				ax, ay + 3,
+				ax - 5, ay - 3,
+				ax + 5, ay - 3
+			);
+		}
+		ab.delete();
+	};
+}
+
+// 公共 API 仅导出工厂与主题；实现类和辅助函数保持局部。
+create = function(ctrl, options){
+	return inputView(ctrl, options);
+};
+
+createModel = function(options){
+	return inputView(null, options);
+};
+
+/**intellisense()
+uiColorKit.input = plus 颜色输入控件，点击后弹出共享的 uiColorKit.picker
+uiColorKit.input.create(ctrl,[options]) = 绑定 plus 控件并创建输入视图，返回 uiColorKitInputView
+uiColorKit.input.createModel([options]) = 创建无控件输入模型，返回 uiColorKitInputView
+uiColorKit.input.themes = 内置 dark、light 主题表
+end intellisense**/
+
+/**intellisense(!uiColorKitInputOptions)
+color = 初始颜色，可指定 0xAARRGGBB 或 CSS 颜色字符串
+theme = dark、light 或自定义主题表
+showAlpha = 弹出选择器是否显示透明度，默认为 true
+colorMode = 弹出选择器初始模式
+radius = 输入控件圆角半径，默认为 8
+fontName = 字体名称
+fontSize = 字体大小，默认为 13
+draw = 是否绘制默认 InputView 外观，默认为 true；设为 false 时不绘制默认样式
+onDraw = draw=false 时的自定义绘制回调，参数为 graphics,rc,view；返回值忽略
+noDraw = draw=false 的兼容别名
+popupWidth = 弹出选择器宽度，默认为 320
+popupHeight = 弹出选择器高度，默认为 380
+end intellisense**/
+
+/**intellisense(!uiColorKitInputView)
+attach(ctrl) = 将输入视图绑定到 plus 控件并返回自身
+getColor() = 获取当前颜色，返回 0xAARRGGBB
+setColor(color,[silent]) = 设置颜色；支持 0xAARRGGBB 或 CSS 字符串，silent=true 不触发 onChange
+setHex(hex,[silent]) = 以 CSS HEX 设置颜色
+getHex() = 获取 CSS HEX；showAlpha=false 时不输出透明度
+getRgb() = 获取 red,green,blue
+setTheme(theme) = 设置 dark、light 或自定义主题
+setOptions(options) = 批量更新选项，可更新颜色、主题、模式、尺寸及自定义绘制
+open() = 打开颜色选择弹窗；无控件模型不执行打开操作
+close([commit]) = 关闭弹窗；省略或 true 提交，false 取消
+isOpen() = 判断当前视图是否打开弹窗
+dispose() = 关闭并取消弹窗，解除控件事件并释放资源
+onChange = 颜色即时变化回调，参数为 view,color
+onCommit = 关闭时提交回调，参数为 view,color
+onOpen = 弹窗打开回调，参数为 view,color
+onClose = 弹窗关闭回调，参数为 view,color
+end intellisense**/

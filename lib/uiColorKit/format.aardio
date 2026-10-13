@@ -1,0 +1,1135 @@
+/*
+	uiColorKit.format — CSS Color 4 颜色格式与色彩空间互转
+
+	CSS 解析与输出支持：
+	  oklab(L a b) / oklch(L C H)
+	  lab(L a b) / lch(L C H)
+	  hsl(h s l) / rgb(r g b) / hex
+
+	HSV/HSB/CMYK 仅作为色彩空间转换 API，不混入 CSS 解析与输出。
+	另支持 aardio 0xAARRGGBB 数值与字符串。
+
+	内部与工程一致使用 0xAARRGGBB。
+	纯逻辑实现，无 UI；
+	输出精度统一见 PREC（通行做法，去尾随 0）。
+
+	用法：
+		import uiColorKit;
+		// 或 import uiColorKit.format;
+
+		var c = uiColorKit.format.parse("oklch(0.628 0.258 29.2)");
+		var hex = uiColorKit.format.toHex(c);
+		var css = uiColorKit.format.toCss(c, "hsl");
+		var c2 = uiColorKit.format.parse("oklch(0.628 0.258 29.2)");
+*/
+namespace uiColorKit.format;
+
+// ============================================================
+// 基础工具
+// ============================================================
+var num = function(v, d){
+	if(d === null) d = 0;
+	if(type(v) != type.number) return d;
+	return v;
+};
+
+// 公共入口拒绝非数值，实际区间限制交给标准库。
+var clamp = function(v, a, b){
+	return ..math.clamp(num(v, a), a, b);
+};
+
+var clamp01 = function(v){
+	return clamp(v, 0, 1);
+};
+
+var floor = function(v){
+	return ..math.floor(v);
+};
+
+var abs = function(v){
+	return ..math.abs(v);
+};
+
+var sqrt = function(v){
+	return ..math.sqrt(v);
+};
+
+var pow = function(a, b){
+	return a ** b;
+};
+
+var sin = function(v){
+	return ..math.sin(v);
+};
+
+var cos = function(v){
+	return ..math.cos(v);
+};
+
+// 有符号立方根（负值也可）
+var cbrt = function(v){
+	if(v < 0) return -pow(-v, 1 / 3);
+	return pow(v, 1 / 3);
+};
+
+// atan2：用 math.atan + 象限
+var atan2 = function(y, x){
+	if(x == 0 && y == 0) return 0;
+	if(x > 0) return ..math.atan(y / x);
+	if(x < 0){
+		if(y >= 0) return ..math.atan(y / x) + ..math.pi;
+		return ..math.atan(y / x) - ..math.pi;
+	}
+	if(y > 0) return ..math.pi / 2;
+	return -..math.pi / 2;
+};
+
+var radToDeg = function(r){
+	return r * 180 / ..math.pi;
+};
+
+var degToRad = function(d){
+	return d * ..math.pi / 180;
+};
+
+// 角度归一到 [0, 360)
+var normDeg = function(h){
+	h = h - floor(h / 360) * 360;
+	if(h < 0) h = h + 360;
+	return h;
+};
+
+// ============================================================
+// ARGB 打包（与 picker 一致）
+// ============================================================
+// 颜色值统一限制为无符号 32 位，避免异常大整数进入格式化
+var u32 = function(c){
+	if(type(c) != type.number || c != c) return 0;
+	c = c % 0x100000000;
+	if(c < 0) c = c + 0x100000000;
+	return floor(c);
+};
+
+var rgbOf = function(c){
+	return u32(c) % 0x1000000;
+};
+
+var alphaOf = function(c){
+	return floor(u32(c) / 0x1000000) % 256;
+};
+
+var withAlpha = function(c, a){
+	return floor(clamp(a, 0, 255) + 0.5) * 0x1000000 + rgbOf(c);
+};
+
+var packRGB = function(r, g, b){
+	return floor(clamp(r, 0, 255) + 0.5) * 0x10000 + floor(clamp(g, 0, 255) + 0.5) * 0x100 + floor(clamp(b, 0, 255) + 0.5);
+};
+
+var packARGB = function(a, r, g, b){
+	return floor(clamp(a, 0, 255) + 0.5) * 0x1000000 + packRGB(r, g, b);
+};
+
+var colorToRgb = function(c){
+	var rgb = rgbOf(c);
+	var r = floor(rgb / 0x10000);
+	var g = floor(rgb / 0x100) - r * 0x100;
+	var b = rgb - r * 0x10000 - g * 0x100;
+	return clamp(r, 0, 255), clamp(g, 0, 255), clamp(b, 0, 255);
+};
+
+// ============================================================
+// sRGB 编码 / 线性化
+// r,g,b 与 R,G,B 均为 0–1
+// ============================================================
+var srgbToLinear = function(c){
+	if(c <= 0.04045) return c / 12.92;
+	return pow((c + 0.055) / 1.055, 2.4);
+};
+
+var linearToSrgb = function(c){
+	if(c <= 0.0031308) return c * 12.92;
+	return 1.055 * pow(c, 1 / 2.4) - 0.055;
+};
+
+// 0–255 → 线性 0–1
+var rgb255ToLinear = function(r, g, b){
+	return srgbToLinear(clamp(r, 0, 255) / 255),
+		srgbToLinear(clamp(g, 0, 255) / 255),
+		srgbToLinear(clamp(b, 0, 255) / 255);
+};
+
+// 线性 0–1 → 0–255（夹紧）
+var linearToRgb255 = function(R, G, B){
+	return floor(clamp(linearToSrgb(clamp(R, 0, 1)) * 255 + 0.5, 0, 255)),
+		floor(clamp(linearToSrgb(clamp(G, 0, 1)) * 255 + 0.5, 0, 255)),
+		floor(clamp(linearToSrgb(clamp(B, 0, 1)) * 255 + 0.5, 0, 255));
+};
+
+// ============================================================
+// HSL / HSV / CMYK
+// 内部比例：h 0–360，s/l/v/c/m/y/k 0–1
+// ============================================================
+var rgbToHsl = function(r, g, b){
+	r = clamp(r, 0, 255) / 255;
+	g = clamp(g, 0, 255) / 255;
+	b = clamp(b, 0, 255) / 255;
+	var max = ..math.max(r, ..math.max(g, b));
+	var min = ..math.min(r, ..math.min(g, b));
+	var d = max - min;
+	var l = (max + min) / 2;
+	var h = 0;
+	var s = 0;
+	if(d > 0){
+		s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+		if(max == r) h = (g - b) / d + (g < b ? 6 : 0);
+		elseif(max == g) h = (b - r) / d + 2;
+		else h = (r - g) / d + 4;
+		h = normDeg(h * 60);
+	}
+	return h, s, l;
+};
+
+var hslToRgb = function(h, s, l){
+	h = normDeg(num(h, 0));
+	s = clamp01(s);
+	l = clamp01(l);
+	if(s <= 0){
+		var c = floor(l * 255 + 0.5);
+		return c, c, c;
+	}
+	var c = (1 - abs(2 * l - 1)) * s;
+	var hp = h / 60;
+	var x = c * (1 - abs((hp - 2 * floor(hp / 2)) - 1));
+	var m = l - c / 2;
+	var r, g, b;
+	if(hp < 1){ r = c; g = x; b = 0; }
+	elseif(hp < 2){ r = x; g = c; b = 0; }
+	elseif(hp < 3){ r = 0; g = c; b = x; }
+	elseif(hp < 4){ r = 0; g = x; b = c; }
+	elseif(hp < 5){ r = x; g = 0; b = c; }
+	else { r = c; g = 0; b = x; }
+	return floor((r + m) * 255 + 0.5), floor((g + m) * 255 + 0.5), floor((b + m) * 255 + 0.5);
+};
+
+var rgbToHsv = function(r, g, b){
+	r = clamp(r, 0, 255) / 255;
+	g = clamp(g, 0, 255) / 255;
+	b = clamp(b, 0, 255) / 255;
+	var max = ..math.max(r, ..math.max(g, b));
+	var min = ..math.min(r, ..math.min(g, b));
+	var d = max - min;
+	var h = 0;
+	var s = 0;
+	if(max > 0) s = d / max;
+	var v = max;
+	if(d > 0){
+		if(max == r) h = (g - b) / d + (g < b ? 6 : 0);
+		elseif(max == g) h = (b - r) / d + 2;
+		else h = (r - g) / d + 4;
+		h = normDeg(h * 60);
+	}
+	return h, s, v;
+};
+
+var hsvToRgb = function(h, s, v){
+	h = normDeg(num(h, 0));
+	s = clamp01(s);
+	v = clamp01(v);
+	if(s <= 0){
+		var c = floor(v * 255 + 0.5);
+		return c, c, c;
+	}
+	var c = v * s;
+	var hp = h / 60;
+	var x = c * (1 - abs((hp - 2 * floor(hp / 2)) - 1));
+	var m = v - c;
+	var r, g, b;
+	if(hp < 1){ r = c; g = x; b = 0; }
+	elseif(hp < 2){ r = x; g = c; b = 0; }
+	elseif(hp < 3){ r = 0; g = c; b = x; }
+	elseif(hp < 4){ r = 0; g = x; b = c; }
+	elseif(hp < 5){ r = x; g = 0; b = c; }
+	else { r = c; g = 0; b = x; }
+	return floor((r + m) * 255 + 0.5), floor((g + m) * 255 + 0.5), floor((b + m) * 255 + 0.5);
+};
+
+// CMYK 0–1；灰用 k 承载
+var rgbToCmyk = function(r, g, b){
+	r = clamp(r, 0, 255) / 255;
+	g = clamp(g, 0, 255) / 255;
+	b = clamp(b, 0, 255) / 255;
+	var k = 1 - ..math.max(r, ..math.max(g, b));
+	if(k >= 0.999999) return 0, 0, 0, 1;
+	var inv = 1 - k;
+	return (1 - r - k) / inv, (1 - g - k) / inv, (1 - b - k) / inv, k;
+};
+
+var cmykToRgb = function(c, m, y, k){
+	c = clamp01(c);
+	m = clamp01(m);
+	y = clamp01(y);
+	k = clamp01(k);
+	var r = (1 - c) * (1 - k);
+	var g = (1 - m) * (1 - k);
+	var b = (1 - y) * (1 - k);
+	return floor(r * 255 + 0.5), floor(g * 255 + 0.5), floor(b * 255 + 0.5);
+};
+
+// ============================================================
+// XYZ（D65）与 sRGB 线性
+// ============================================================
+var linearRgbToXyz = function(R, G, B){
+	var X = 0.4124564 * R + 0.3575761 * G + 0.1804375 * B;
+	var Y = 0.2126729 * R + 0.7151522 * G + 0.0721750 * B;
+	var Z = 0.0193339 * R + 0.1191920 * G + 0.9503041 * B;
+	return X, Y, Z;
+};
+
+var xyzToLinearRgb = function(X, Y, Z){
+	var R = 3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z;
+	var G = -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z;
+	var B = 0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
+	return R, G, B;
+};
+
+// D65 → D50（Bradford），CIE Lab / LCH 使用 D50
+var xyzD65ToD50 = function(X, Y, Z){
+	var X2 = 1.0478112 * X + 0.0228866 * Y - 0.0501270 * Z;
+	var Y2 = 0.0295424 * X + 0.9904844 * Y - 0.0170491 * Z;
+	var Z2 = -0.0092345 * X + 0.0150436 * Y + 0.7521316 * Z;
+	return X2, Y2, Z2;
+};
+
+var xyzD50ToD65 = function(X, Y, Z){
+	var X2 = 0.9555766 * X - 0.0230393 * Y + 0.0631636 * Z;
+	var Y2 = -0.0282895 * X + 1.0099416 * Y + 0.0210077 * Z;
+	var Z2 = 0.0122982 * X - 0.0204830 * Y + 1.3299098 * Z;
+	return X2, Y2, Z2;
+};
+
+// ============================================================
+// CIE Lab / LCH（D50，CSS Color 4 lab()/lch()）
+// L: 0–100, a/b: 约 -125–125, C: ≥0, H: 0–360
+// ============================================================
+var Xn = 0.96422;
+var Yn = 1.0;
+var Zn = 0.82521;
+
+var fLab = function(t){
+	// CIE 标准：δ=6/29
+	if(t > 216 / 24389) return cbrt(t);
+	return (24389 / 27 * t + 16) / 116;
+};
+
+var fLabInv = function(t){
+	var t3 = t * t * t;
+	if(t3 > 216 / 24389) return t3;
+	return (116 * t - 16) / (24389 / 27);
+};
+
+var xyzD50ToLab = function(X, Y, Z){
+	var fx = fLab(X / Xn);
+	var fy = fLab(Y / Yn);
+	var fz = fLab(Z / Zn);
+	var L = 116 * fy - 16;
+	var a = 500 * (fx - fy);
+	var b = 200 * (fy - fz);
+	return L, a, b;
+};
+
+var labToXyzD50 = function(L, a, b){
+	var fy = (L + 16) / 116;
+	var fx = fy + a / 500;
+	var fz = fy - b / 200;
+	return fLabInv(fx) * Xn, fLabInv(fy) * Yn, fLabInv(fz) * Zn;
+};
+
+var labToLch = function(L, a, b){
+	var C = sqrt(a * a + b * b);
+	var H = 0;
+	// 中性色 C≈0，色相无意义
+	if(C > 1e-4) H = normDeg(radToDeg(atan2(b, a)));
+	return L, C, H;
+};
+
+var lchToLab = function(L, C, H){
+	var a = C * cos(degToRad(H));
+	var b = C * sin(degToRad(H));
+	return L, a, b;
+};
+
+// ============================================================
+// OKLab / OKLCH（Björn Ottosson，CSS Color 4 oklab()/oklch()）
+// L: 0–1, a/b: 约 -0.4–0.4, C: ≥0, H: 0–360
+// ============================================================
+var linearRgbToOklab = function(R, G, B){
+	var l = 0.4122214708 * R + 0.5363325363 * G + 0.0514459929 * B;
+	var m = 0.2119034982 * R + 0.6806995451 * G + 0.1073969566 * B;
+	var s = 0.0883024619 * R + 0.2817188376 * G + 0.6299787005 * B;
+	var l_ = cbrt(l);
+	var m_ = cbrt(m);
+	var s_ = cbrt(s);
+	var L = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+	var a = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+	var b = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+	return L, a, b;
+};
+
+var oklabToLinearRgb = function(L, a, b){
+	var l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+	var m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+	var s_ = L - 0.0894841775 * a - 1.2914855480 * b;
+	var l = l_ * l_ * l_;
+	var m = m_ * m_ * m_;
+	var s = s_ * s_ * s_;
+	var R = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+	var G = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+	var B = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+	return R, G, B;
+};
+
+var oklabToOklch = function(L, a, b){
+	var C = sqrt(a * a + b * b);
+	var H = 0;
+	// 中性色 C≈0，色相无意义
+	if(C > 1e-4) H = normDeg(radToDeg(atan2(b, a)));
+	return L, C, H;
+};
+
+var oklchToOklab = function(L, C, H){
+	var a = C * cos(degToRad(H));
+	var b = C * sin(degToRad(H));
+	return L, a, b;
+};
+
+// ============================================================
+// RGB 0–255 ↔ 各空间
+// ============================================================
+var rgbToOklab = function(r, g, b){
+	var R, G, B = rgb255ToLinear(r, g, b);
+	return linearRgbToOklab(R, G, B);
+};
+
+var oklabToRgb = function(L, a, b){
+	var R, G, B = oklabToLinearRgb(L, a, b);
+	return linearToRgb255(R, G, B);
+};
+
+var rgbToOklch = function(r, g, b){
+	var L, a, bb = rgbToOklab(r, g, b);
+	return oklabToOklch(L, a, bb);
+};
+
+var oklchToRgb = function(L, C, H){
+	var L0, a, bb = oklchToOklab(L, C, H);
+	return oklabToRgb(L0, a, bb);
+};
+
+var rgbToLab = function(r, g, b){
+	var R, G, B = rgb255ToLinear(r, g, b);
+	var X, Y, Z = linearRgbToXyz(R, G, B);
+	var X2, Y2, Z2 = xyzD65ToD50(X, Y, Z);
+	return xyzD50ToLab(X2, Y2, Z2);
+};
+
+var labToRgb = function(L, a, b){
+	var X, Y, Z = labToXyzD50(L, a, b);
+	var X2, Y2, Z2 = xyzD50ToD65(X, Y, Z);
+	var R, G, B = xyzToLinearRgb(X2, Y2, Z2);
+	return linearToRgb255(R, G, B);
+};
+
+var rgbToLch = function(r, g, b){
+	var L, a, bb = rgbToLab(r, g, b);
+	return labToLch(L, a, bb);
+};
+
+var lchToRgb = function(L, C, H){
+	var L0, a, bb = lchToLab(L, C, H);
+	return labToRgb(L0, a, bb);
+};
+
+// ============================================================
+// 颜色值 (AARRGGBB) ↔ 各空间
+// ============================================================
+// alpha 统一按 0–255（与 packARGB 一致）；null → 255
+var alpha255 = function(alpha){
+	if(alpha === null) return 255;
+	return floor(clamp(alpha, 0, 255) + 0.5);
+};
+
+var colorToOklab = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, a, bb = rgbToOklab(r, g, b);
+	return L, a, bb, alphaOf(c) / 255;
+};
+
+var oklabToColor = function(L, a, b, alpha){
+	var r, g, bb = oklabToRgb(L, a, b);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+var colorToOklch = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, C, H = rgbToOklch(r, g, b);
+	return L, C, H, alphaOf(c) / 255;
+};
+
+var oklchToColor = function(L, C, H, alpha){
+	var r, g, bb = oklchToRgb(L, C, H);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+var colorToLab = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, a, bb = rgbToLab(r, g, b);
+	return L, a, bb, alphaOf(c) / 255;
+};
+
+var labToColor = function(L, a, b, alpha){
+	var r, g, bb = labToRgb(L, a, b);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+var colorToLch = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, C, H = rgbToLch(r, g, b);
+	return L, C, H, alphaOf(c) / 255;
+};
+
+var lchToColor = function(L, C, H, alpha){
+	var r, g, bb = lchToRgb(L, C, H);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+// ---------- HSL / HSV / CMYK ↔ 颜色值 ----------
+var colorToHsl = function(c){
+	var r, g, b = colorToRgb(c);
+	var h, s, l = rgbToHsl(r, g, b);
+	return h, s, l, alphaOf(c) / 255;
+};
+
+var hslToColor = function(h, s, l, alpha){
+	var r, g, bb = hslToRgb(h, s, l);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+var colorToHsv = function(c){
+	var r, g, b = colorToRgb(c);
+	var h, s, v = rgbToHsv(r, g, b);
+	return h, s, v, alphaOf(c) / 255;
+};
+
+var hsvToColor = function(h, s, v, alpha){
+	var r, g, bb = hsvToRgb(h, s, v);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+var colorToCmyk = function(c){
+	var r, g, b = colorToRgb(c);
+	var cy, mg, yl, k = rgbToCmyk(r, g, b);
+	return cy, mg, yl, k, alphaOf(c) / 255;
+};
+
+var cmykToColor = function(cy, mg, yl, k, alpha){
+	var r, g, bb = cmykToRgb(cy, mg, yl, k);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+// ============================================================
+// HEX
+// ============================================================
+var hexNibble = function(ch){
+	if(ch == "0") return 0;
+	if(ch == "1") return 1;
+	if(ch == "2") return 2;
+	if(ch == "3") return 3;
+	if(ch == "4") return 4;
+	if(ch == "5") return 5;
+	if(ch == "6") return 6;
+	if(ch == "7") return 7;
+	if(ch == "8") return 8;
+	if(ch == "9") return 9;
+	if(ch == "A") return 10;
+	if(ch == "B") return 11;
+	if(ch == "C") return 12;
+	if(ch == "D") return 13;
+	if(ch == "E") return 14;
+	if(ch == "F") return 15;
+	return -1;
+};
+
+var hexByteAt = function(t, a, b){
+	return hexNibble(..string.sub(t, a, a)) * 16 + hexNibble(..string.sub(t, b, b));
+};
+
+var parseHex = function(s){
+	if(type(s) != type.string) return null;
+	var t = ..string.trim(s);
+	if(..string.sub(t, 1, 1) == "#") t = ..string.sub(t, 2);
+	t = ..string.upper(t);
+	var n = #t;
+	if(n != 3 && n != 4 && n != 6 && n != 8) return null;
+	for(i=1; n; 1){
+		if(hexNibble(..string.sub(t, i, i)) < 0) return null;
+	}
+	if(n == 3){
+		return packARGB(255,
+			hexNibble(..string.sub(t, 1, 1)) * 17,
+			hexNibble(..string.sub(t, 2, 2)) * 17,
+			hexNibble(..string.sub(t, 3, 3)) * 17);
+	}
+	if(n == 4){
+		// CSS #RGBA
+		return packARGB(
+			hexNibble(..string.sub(t, 4, 4)) * 17,
+			hexNibble(..string.sub(t, 1, 1)) * 17,
+			hexNibble(..string.sub(t, 2, 2)) * 17,
+			hexNibble(..string.sub(t, 3, 3)) * 17);
+	}
+	if(n == 6){
+		return packARGB(255, hexByteAt(t, 1, 2), hexByteAt(t, 3, 4), hexByteAt(t, 5, 6));
+	}
+	// CSS #RRGGBBAA
+	return packARGB(hexByteAt(t, 7, 8), hexByteAt(t, 1, 2), hexByteAt(t, 3, 4), hexByteAt(t, 5, 6));
+};
+
+var formatHex = function(c, withA){
+	var r, g, b = colorToRgb(c);
+	if(withA){
+		return ..string.format("#%02X%02X%02X%02X", r, g, b, alphaOf(c));
+	}
+	return ..string.format("#%02X%02X%02X", r, g, b);
+};
+
+// aardio 数值颜色格式：不透明输出 0xRRGGBB，否则输出 0xAARRGGBB。
+var formatAardio = function(c){
+	var r, g, b = colorToRgb(c);
+	if(alphaOf(c) < 255){
+		return ..string.format("0x%02X%02X%02X%02X", alphaOf(c), r, g, b);
+	}
+	return ..string.format("0x%02X%02X%02X", r, g, b);
+};
+
+var parseAardioValue = function(s){
+	if(type(s) != type.string) return null;
+	var t = ..string.trim(s);
+	if(..string.sub(..string.lower(t), 1, 2) != "0x") return null;
+	t = ..string.sub(t, 3);
+	var n = #t;
+	if(n != 6 && n != 8) return null;
+	var raw = ..string.upper(t);
+	for(i=1, n, 1){
+		if(hexNibble(..string.sub(raw, i, i)) < 0) return null;
+	}
+	if(n == 6) return packARGB(255, hexByteAt(raw,1,2), hexByteAt(raw,3,4), hexByteAt(raw,5,6));
+	return packARGB(hexByteAt(raw,1,2), hexByteAt(raw,3,4), hexByteAt(raw,5,6), hexByteAt(raw,7,8));
+};
+
+// 是否输出 alpha：true/1 强制带，false/0 强制不带，null 不透明则省略
+var wantAlpha = function(c, withAlpha){
+	if(withAlpha === true || withAlpha === 1) return true;
+	if(withAlpha === false || withAlpha === 0) return false;
+	return alphaOf(c) < 255;
+};
+
+// ============================================================
+// 数字解析（CSS：123 / 123.4 / .5 / -1 / 50% / 50.5%）
+// 返回 value, isPercent, ok
+// ============================================================
+var trim = function(s){
+	if(type(s) != type.string) return "";
+	return ..string.trim(s);
+};
+
+var parseNumber = function(s){
+	s = trim(s);
+	if(s == "") return 0, false, false;
+	var isPercent = false;
+	var raw = s;
+	if(..string.sub(raw, #raw, #raw) == "%"){
+		isPercent = true;
+		raw = trim(..string.sub(raw, 1, #raw - 1));
+	}
+	// 允许前导 + -
+	var start = 1;
+	var ch1 = ..string.sub(raw, 1, 1);
+	if(ch1 == "+" || ch1 == "-") start = 2;
+	if(#raw < start) return 0, false, false;
+	var hasDot = false;
+	var hasDigit = false;
+	for(i=start; #raw; 1){
+		var ch = ..string.sub(raw, i, i);
+		if(ch >= "0" && ch <= "9"){ hasDigit = true; continue; }
+		if(ch == "."){
+			if(hasDot) return 0, false, false;
+			hasDot = true;
+			continue;
+		}
+		return 0, false, false;
+	}
+	if(!hasDigit) return 0, false, false;
+	var v = tonumber(raw);
+	if(v === null) return 0, false, false;
+	return v, isPercent, true;
+};
+
+// 把 CSS 组件值折算到标准区间
+// kind: "L100" | "L1" | "ab" | "C" | "H" | "alpha" | "rgb"
+var resolveComponent = function(v, isPercent, kind){
+	if(kind == "L100"){
+		if(isPercent) return clamp(v / 100 * 100, 0, 100);
+		return clamp(v, 0, 100);
+	}
+	if(kind == "L1"){
+		if(isPercent) return clamp(v / 100, 0, 1);
+		// 数字 0–1；也接受 >1 的 0–100 习惯值
+		if(v > 1.0001) return clamp(v / 100, 0, 1);
+		return clamp(v, 0, 1);
+	}
+	if(kind == "ab"){
+		// lab a/b：100% = 125
+		if(isPercent) return v / 100 * 125;
+		return v;
+	}
+	if(kind == "okab"){
+		// oklab a/b：100% = 0.4
+		if(isPercent) return v / 100 * 0.4;
+		return v;
+	}
+	if(kind == "C150"){
+		if(isPercent) return abs(v / 100 * 150);
+		return abs(v);
+	}
+	if(kind == "C04"){
+		if(isPercent) return abs(v / 100 * 0.4);
+		return abs(v);
+	}
+	if(kind == "H"){
+		if(isPercent) return normDeg(v / 100 * 360);
+		return normDeg(v);
+	}
+	if(kind == "alpha"){
+		if(isPercent) return clamp(v / 100, 0, 1);
+		// CSS 为 0–1；>1 时按 0–255 便利解析
+		if(v > 1) return clamp(v / 255, 0, 1);
+		return clamp(v, 0, 1);
+	}
+	if(kind == "rgb"){
+		if(isPercent) return clamp(v / 100 * 255, 0, 255);
+		return clamp(v, 0, 255);
+	}
+	// 比例分量：百分比或 0–1（>1 时按 0–100 理解）
+	if(kind == "ratio"){
+		if(isPercent) return clamp(v / 100, 0, 1);
+		if(v > 1.0001) return clamp(v / 100, 0, 1);
+		return clamp(v, 0, 1);
+	}
+	return v;
+};
+
+// ============================================================
+// 拆分 CSS 函数参数
+// 支持：
+//   oklab(0.5 0.1 0.2)
+//   oklab(0.5 0.1 0.2 / 0.5)
+//   oklab(50% 0.1 0.2, 0.5)   逗号兼容
+// 返回 components 表 + alpha 值/百分比 + ok
+// ============================================================
+var splitCssArgs = function(inner){
+	// 先按 / 拆 alpha
+	var alphaRaw = null;
+	var body = inner;
+	var slashPos = 0;
+	var n = #inner;
+	for(i=1; n; 1){
+		if(..string.sub(inner, i, i) == "/"){ slashPos = i; break; }
+	}
+	if(slashPos > 0){
+		body = ..string.sub(inner, 1, slashPos - 1);
+		alphaRaw = ..string.sub(inner, slashPos + 1);
+	}
+
+	// 按空白或逗号拆
+	var parts = {};
+	var cur = "";
+	var m = #body;
+	for(i=1; m; 1){
+		var ch = ..string.sub(body, i, i);
+		if(ch == " " || ch == "\t" || ch == "\n" || ch == "\r" || ch == ","){
+			if(cur != ""){
+				parts[#parts + 1] = cur;
+				cur = "";
+			}
+			continue;
+		}
+		cur = cur ++ ch;
+	}
+	if(cur != "") parts[#parts + 1] = cur;
+
+	var out = {};
+	for(i=1; #parts; 1){
+		var v, isP, ok = parseNumber(parts[i]);
+		if(!ok) return null;
+		out[#out + 1] = { v = v; p = isP; };
+	}
+
+	var alpha = 1;
+	var alphaOk = true;
+	if(alphaRaw !== null){
+		var av, ap, aok = parseNumber(alphaRaw);
+		if(!aok) return null;
+		alpha = resolveComponent(av, ap, "alpha");
+	}
+	return out, alpha;
+};
+
+// ============================================================
+// CSS 字符串解析
+// 返回 AARRGGBB 或 null
+// ============================================================
+var parseCss = function(s){
+	if(type(s) != type.string) return null;
+	var t = trim(s);
+	if(t == "") return null;
+	if(..string.lower(t) == "transparent") return 0;
+
+	// hex / #rgb
+	if(..string.sub(t, 1, 1) == "#") return parseHex(t);
+
+	// 无 # 的纯 hex（3/6/8 位十六进制）
+	var cleaned = ..string.upper(t);
+	var clen = #cleaned;
+	if(clen == 3 || clen == 6 || clen == 8){
+		var allHex = true;
+		for(i=1; clen; 1){
+			if(hexNibble(..string.sub(cleaned, i, i)) < 0){ allHex = false; break; }
+		}
+		if(allHex) return parseHex(t);
+	}
+
+	// 函数式
+	var lower = ..string.lower(t);
+	var lp = 0;
+	var n = #lower;
+	for(i=1; n; 1){
+		if(..string.sub(lower, i, i) == "("){ lp = i; break; }
+	}
+	if(lp <= 1) return null;
+	if(..string.sub(lower, #lower, #lower) != ")") return null;
+	var fn = trim(..string.sub(lower, 1, lp - 1));
+	var inner = ..string.sub(lower, lp + 1, #lower - 1);
+
+	var args, alpha = splitCssArgs(inner);
+	if(args === null) return null;
+
+	// CSS 现代语法使用斜杠指定 alpha；传统 rgba()/hsla() 使用第 4 个逗号参数。
+	// 其他函数必须严格为 3 个颜色分量，禁止静默忽略尾部参数。
+	if(fn == "rgba" || fn == "hsla"){
+		if(#args == 4){
+			// 同时出现斜杠 alpha 与第 4 参数属于歧义输入。
+			if(..string.indexOf(inner, "/")) return null;
+			alpha = resolveComponent(args[4].v, args[4].p, "alpha");
+		}
+		elseif(#args != 3) return null;
+	}
+	elseif(#args != 3) return null;
+
+	var aA = floor(alpha * 255 + 0.5);
+
+	if(fn == "oklab"){
+		var oL = resolveComponent(args[1].v, args[1].p, "L1");
+		var oa = resolveComponent(args[2].v, args[2].p, "okab");
+		var ob = resolveComponent(args[3].v, args[3].p, "okab");
+		return oklabToColor(oL, oa, ob, aA);
+	}
+	if(fn == "oklch"){
+		var cL = resolveComponent(args[1].v, args[1].p, "L1");
+		var cC = resolveComponent(args[2].v, args[2].p, "C04");
+		var cH = resolveComponent(args[3].v, args[3].p, "H");
+		return oklchToColor(cL, cC, cH, aA);
+	}
+	if(fn == "lab"){
+		var bl = resolveComponent(args[1].v, args[1].p, "L100");
+		var ba = resolveComponent(args[2].v, args[2].p, "ab");
+		var bb = resolveComponent(args[3].v, args[3].p, "ab");
+		return labToColor(bl, ba, bb, aA);
+	}
+	if(fn == "lch"){
+		var ll = resolveComponent(args[1].v, args[1].p, "L100");
+		var lc = resolveComponent(args[2].v, args[2].p, "C150");
+		var lh = resolveComponent(args[3].v, args[3].p, "H");
+		return lchToColor(ll, lc, lh, aA);
+	}
+	if(fn == "rgb" || fn == "rgba"){
+		var rr = resolveComponent(args[1].v, args[1].p, "rgb");
+		var gg = resolveComponent(args[2].v, args[2].p, "rgb");
+		var b2 = resolveComponent(args[3].v, args[3].p, "rgb");
+		return packARGB(aA, rr, gg, b2);
+	}
+	if(fn == "hsl" || fn == "hsla"){
+		var hh = resolveComponent(args[1].v, args[1].p, "H");
+		var hs = resolveComponent(args[2].v, args[2].p, "ratio");
+		var hl = resolveComponent(args[3].v, args[3].p, "ratio");
+		return hslToColor(hh, hs, hl, aA);
+	}
+	return null;
+};
+
+// ============================================================
+// 格式化辅助（PREC / fmtTrim / fmtPct 在文末命名空间导出）
+// ============================================================
+// alpha 文本：0–1，PREC.alpha 位
+var fmtAlpha = function(a01){
+	return fmtTrim(a01, PREC.alpha);
+};
+
+// ============================================================
+// 导出 API
+// ============================================================
+PREC = {
+	rgb = 0;
+	hue = 2;
+	pct = 1;
+	lab = 3;
+	oklab = 4;
+	okH = 3;
+	alpha = 3;
+};
+
+toAardio = function(c){
+	return formatAardio(c);
+};
+
+parseAardio = function(s){
+	return parseAardioValue(s);
+};
+
+parse = function(s){
+	if(type(s) == type.number){
+		return u32(s);
+	}
+	if(type(s) != type.string) return null;
+	if(..string.sub(..string.lower(trim(s)), 1, 2) == "0x") return parseAardioValue(s);
+	return parseCss(s);
+};
+
+toHex = function(c, withAlpha){
+	return formatHex(c, wantAlpha(c, withAlpha));
+};
+
+toCss = function(c, space, withAlpha){
+	if(space === null) space = "oklch";
+	var a01 = alphaOf(c) / 255;
+	var needA = wantAlpha(c, withAlpha);
+	var aStr = fmtAlpha(a01);
+
+	// fn( body / alpha ) —— 各空间共用的拼装
+	var css = function(fn, body){
+		if(needA) return fn ++ "(" ++ body ++ " / " ++ aStr ++ ")";
+		return fn ++ "(" ++ body ++ ")";
+	};
+
+	if(space == "hex") return formatHex(c, needA);
+
+	if(space == "rgb"){
+		var r, g, b = colorToRgb(c);
+		return css("rgb", ..string.format("%d %d %d", r, g, b));
+	}
+
+	if(space == "hsl"){
+		var h, s, l = colorToHsl(c);
+		return css("hsl", fmtTrim(h, PREC.hue) ++ " " ++ fmtPct(s) ++ " " ++ fmtPct(l));
+	}
+
+
+	if(space == "oklab"){
+		var L, a, b = colorToOklab(c);
+		return css("oklab", fmtTrim(L, PREC.oklab) ++ " " ++ fmtTrim(a, PREC.oklab) ++ " " ++ fmtTrim(b, PREC.oklab));
+	}
+
+	if(space == "oklch"){
+		var L, C, H = colorToOklch(c);
+		return css("oklch", fmtTrim(L, PREC.oklab) ++ " " ++ fmtTrim(C, PREC.oklab) ++ " " ++ fmtTrim(H, PREC.okH));
+	}
+
+	if(space == "lab"){
+		var L, a, b = colorToLab(c);
+		return css("lab", fmtTrim(L, PREC.lab) ++ " " ++ fmtTrim(a, PREC.lab) ++ " " ++ fmtTrim(b, PREC.lab));
+	}
+
+	if(space == "lch"){
+		var L, C, H = colorToLch(c);
+		return css("lch", fmtTrim(L, PREC.lab) ++ " " ++ fmtTrim(C, PREC.lab) ++ " " ++ fmtTrim(H, PREC.hue));
+	}
+
+	return formatHex(c, needA);
+};
+
+rgb = function(r,g,b, alpha){
+	return packARGB(alpha255(alpha), r, g, b);
+};
+
+oklab = function(L, a, b, alpha){
+	var r, g, bb = oklabToRgb(L, a, b);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+oklch = function(L, C, H, alpha){
+	var r, g, bb = oklchToRgb(L, C, H);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+lab = function(L, a, b, alpha){
+	var r, g, bb = labToRgb(L, a, b);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+lch = function(L, C, H, alpha){
+	var r, g, bb = lchToRgb(L, C, H);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+hsl = function(h, s, l, alpha){
+	var r, g, bb = hslToRgb(h, s, l);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+hsv = function(h, s, v, alpha){
+	var r, g, bb = hsvToRgb(h, s, v);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+hsb = function(h, s, v, alpha){
+	var r, g, bb = hsvToRgb(h, s, v);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+cmyk = function(c, m, y, k, alpha){
+	var r, g, bb = cmykToRgb(c, m, y, k);
+	return packARGB(alpha255(alpha), r, g, bb);
+};
+
+getRgb = function(c){
+	var r, g, b = colorToRgb(c);
+	return r, g, b, alphaOf(c) / 255;
+};
+
+getOklab = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, a, bb = rgbToOklab(r, g, b);
+	return L, a, bb, alphaOf(c) / 255;
+};
+
+getOklch = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, C, H = rgbToOklch(r, g, b);
+	return L, C, H, alphaOf(c) / 255;
+};
+
+getLab = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, a, bb = rgbToLab(r, g, b);
+	return L, a, bb, alphaOf(c) / 255;
+};
+
+getLch = function(c){
+	var r, g, b = colorToRgb(c);
+	var L, C, H = rgbToLch(r, g, b);
+	return L, C, H, alphaOf(c) / 255;
+};
+
+getHsl = function(c){
+	var r, g, b = colorToRgb(c);
+	var h, s, l = rgbToHsl(r, g, b);
+	return h, s, l, alphaOf(c) / 255;
+};
+
+getHsv = function(c){
+	var r, g, b = colorToRgb(c);
+	var h, s, v = rgbToHsv(r, g, b);
+	return h, s, v, alphaOf(c) / 255;
+};
+
+getCmyk = function(c){
+	var r, g, b = colorToRgb(c);
+	var cy, mg, yl, k = rgbToCmyk(r, g, b);
+	return cy, mg, yl, k, alphaOf(c) / 255;
+};
+
+getAlpha = function(c){
+	return alphaOf(c) / 255;
+};
+
+setAlpha = function(c, alpha){
+	return withAlpha(c, clamp01(alpha) * 255);
+};
+
+getRgbValue = function(c){
+	return rgbOf(c);
+};
+
+fmtTrim = function(v, digits){
+	if(digits === null) digits = 2;
+	if(digits != digits || digits < 0) digits = 0;
+	if(v === null || v != v) return "0";
+	var s = ..string.format("%." ++ tostring(digits) ++ "f", v);
+	var n = #s;
+	var dot = 0;
+	for(i=1; n; 1){
+		if(..string.sub(s, i, i) == "."){ dot = i; break; }
+	}
+	if(dot == 0){
+		if(s == "-0") return "0";
+		return s;
+	}
+	var end = n;
+	var j = n;
+	while(j >= dot){
+		if(..string.sub(s, j, j) != "0"){ end = j; break; }
+		j = j - 1;
+	}
+	if(end == dot) end = dot - 1;
+	var out = ..string.sub(s, 1, end);
+	if(out == "-0") out = "0";
+	if(out == "" || out == "-") out = "0";
+	return out;
+};
+
+fmtPct = function(v01, digits){
+	if(digits === null) digits = 1;
+	return fmtTrim(v01 * 100, digits) ++ "%";
+};
+
+/**intellisense()
+uiColorKit.format = CSS Color 4 格式与色彩空间转换，统一颜色值为 0xAARRGGBB
+uiColorKit.format.parse(value) = 解析 CSS、HEX 或数值颜色，失败返回 null
+uiColorKit.format.toHex(color,[withAlpha]) = 输出 #RRGGBB 或 #RRGGBBAA
+uiColorKit.format.toAardio(color) = 输出 0xRRGGBB 或 0xAARRGGBB；alpha 小于 255 时输出 ARGB
+uiColorKit.format.parseAardio(value) = 解析 0xRRGGBB 或 0xAARRGGBB 字符串
+uiColorKit.format.toCss(color,[space],[withAlpha]) = 输出浏览器兼容 CSS；space 可选 hex|rgb|hsl|oklab|oklch|lab|lch，其他值回退为 HEX
+uiColorKit.format.rgb(red,green,blue,[alpha]) = RGB 转 0xAARRGGBB；RGB 与 alpha 范围 0–255，alpha 默认 255
+uiColorKit.format.oklab(lightness,a,b,[alpha]) = OKLab 转 0xAARRGGBB；alpha 范围 0–255
+uiColorKit.format.oklch(lightness,chroma,hue,[alpha]) = OKLCH 转 0xAARRGGBB
+uiColorKit.format.lab(lightness,a,b,[alpha]) = Lab 转 0xAARRGGBB
+uiColorKit.format.lch(lightness,chroma,hue,[alpha]) = LCH 转 0xAARRGGBB
+uiColorKit.format.hsl(hue,saturation,lightness,[alpha]) = HSL 转 0xAARRGGBB
+uiColorKit.format.hsv(hue,saturation,value,[alpha]) = HSV 转 0xAARRGGBB
+uiColorKit.format.hsb(hue,saturation,value,[alpha]) = HSB 转 0xAARRGGBB，等价于 hsv
+uiColorKit.format.cmyk(cyan,magenta,yellow,key,[alpha]) = CMYK 转 0xAARRGGBB
+uiColorKit.format.getRgb(color) = 返回 red,green,blue,alpha；RGB 范围 0–255，alpha 范围 0–1
+uiColorKit.format.getOklab(color) = 返回 lightness,a,b,alpha
+uiColorKit.format.getOklch(color) = 返回 lightness,chroma,hue,alpha
+uiColorKit.format.getLab(color) = 返回 lightness,a,b,alpha
+uiColorKit.format.getLch(color) = 返回 lightness,chroma,hue,alpha
+uiColorKit.format.getHsl(color) = 返回 hue,saturation,lightness,alpha
+uiColorKit.format.getHsv(color) = 返回 hue,saturation,value,alpha
+uiColorKit.format.getCmyk(color) = 返回 cyan,magenta,yellow,key,alpha
+uiColorKit.format.getAlpha(color) = 返回透明度，范围 0–1
+uiColorKit.format.setAlpha(color,alpha) = 返回修改透明度后的 0xAARRGGBB；alpha 范围 0–1
+uiColorKit.format.getRgbValue(color) = 返回不含透明度的 0xRRGGBB
+uiColorKit.format.fmtTrim(value,[digits]) = 格式化数值并去除尾随 0
+uiColorKit.format.fmtPct(value,[digits]) = 将 0–1 数值格式化为百分比字符串
+uiColorKit.format.PREC = 输出精度配置表
+end intellisense**/

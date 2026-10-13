@@ -1,0 +1,2244 @@
+/*
+	uiColorKit.picker — plus 自绘颜色选择器
+
+	SV 面板 + 色相条 + 透明度条 + 预览/多格式输入。
+	完全自绘于 plus 控件，支持拖拽取色，主题 dark/light。
+	输入模式：CSS hex / rgb / hsl / oklab / oklch / lab / lch，以及 aardio 颜色值。
+	用法：
+		import win.ui;
+		import uiColorKit;
+
+		var winform = win.form(text="uiColorKit.picker")
+		winform.add(
+			picker = {cls="plus";left=20;top=20;right=320;bottom=360;bgcolor=0;z=1}
+		)
+
+		var cp = uiColorKit.picker.create(winform.picker, {
+			color = 0xFF3B82F6;
+			theme = "dark";
+			showAlpha = true;
+			showInfo = true;
+		});
+
+		cp.onChange = function(v, color){};
+
+		winform.show();
+		win.loopMessage();
+*/
+import win.ui;
+import win.clip;
+import gdip;
+import gdip.solidBrush;
+import gdip.pen;
+import gdip.path;
+import gdip.bitmap;
+import uiColorKit.format;
+namespace uiColorKit.picker;
+
+
+// ============================================================
+// 私有模型、字段与布局工具（保持在 picker 单文件内，不建立可导入的内部库）
+// ============================================================
+
+var num = function(value, defaultValue){
+	if(type(value) == type.number) return value;
+	return defaultValue;
+};
+var clamp = ..math.clamp;
+var clamp01 = lambda(value) ..math.clamp(num(value,0),0,1);
+var clamp255 = lambda(value) ..math.clamp(num(value,0),0,255);
+var floor = ..math.floor;
+var u32 = ..uiColorKit.format.parse;
+var rgbOf = ..uiColorKit.format.getRgbValue;
+var alphaOf = lambda(color) ..math.floor(..uiColorKit.format.getAlpha(color) * 255 + 0.5);
+var withAlpha = lambda(color,alpha) ..uiColorKit.format.setAlpha(color,alpha / 255);
+var repairHsv = function(hue, saturation, value, alpha){
+	return clamp(num(hue,0),0,359.999),
+		clamp01(saturation),
+		clamp01(value),
+		clamp(num(alpha,255),0,255);
+};
+// ============================================================
+// 主题
+// ============================================================
+var pickerThemes = {
+	dark = {
+		name = "dark";
+		bg = 0xFF1A1B20;
+		surface = 0xFF22232B;
+		border = 0xFF343644;
+		text = 0xFFF2F4F8;
+		textSecondary = 0xFF9AA0A6;
+		textMuted = 0xFF6B7280;
+		accent = 0xFF6B9CFF;
+		handleRing = 0xFFFFFFFF;
+		handleShadow = 0x66000000;
+		// 透明度棋盘：对比拉开一点，低透明度色芯可读
+		checkerA = 0xFF252833;
+		checkerB = 0xFF3C4252;
+		trackBorder = 0x33FFFFFF;
+		focusRing = 0x556B9CFF;
+	};
+	light = {
+		name = "light";
+		bg = 0xFFF7F8FA;
+		surface = 0xFFFFFFFF;
+		border = 0xFFE5E7EB;
+		text = 0xFF1F2329;
+		textSecondary = 0xFF6B7280;
+		textMuted = 0xFF9CA3AF;
+		accent = 0xFF3B82F6;
+		handleRing = 0xFFFFFFFF;
+		handleShadow = 0x33000000;
+		checkerA = 0xFFE8EAED;
+		checkerB = 0xFFF7F8FA;
+		trackBorder = 0x22000000;
+		focusRing = 0x443B82F6;
+	};
+};
+
+var resolveTheme = function(theme){
+	if(theme === null) return ..table.assign({},pickerThemes.dark);
+	if(type(theme) == type.string){
+		return ..table.assign({},pickerThemes[theme] : pickerThemes.dark);
+	}
+	if(type(theme) == type.table){
+		return ..table.assign({},pickerThemes[theme.name] : pickerThemes.dark,theme);
+	}
+	return ..table.assign({},pickerThemes.dark);
+};
+
+// ============================================================
+// 颜色换算（纯逻辑，可单测）
+// h: 0–360，s/v: 0–1，r/g/b: 0–255
+// ============================================================
+var H = {};
+// H 为局部别名
+
+
+H.themes = pickerThemes;
+H.rgbOf = rgbOf;
+H.repairHsv = repairHsv;
+
+
+H.hsvToRgb = function(h, s, v){
+	var color = ..uiColorKit.format.hsv(h, s, v);
+	return ..uiColorKit.format.getRgb(color);
+};
+
+H.rgbToHsv = function(r, g, b){
+	return ..uiColorKit.format.getHsv(..uiColorKit.format.rgb(r, g, b));
+};
+
+H.hsvToColor = function(h, s, v, alpha){
+	return ..uiColorKit.format.hsv(h, s, v, alpha);
+};
+
+H.colorToHsv = function(color){
+	var h, s, v, alpha = ..uiColorKit.format.getHsv(color);
+	return repairHsv(h, s, v, alpha * 255);
+};
+
+H.colorToRgb = function(color){
+	return ..uiColorKit.format.getRgb(color);
+};
+
+// 色相位置 0–1 → 纯色
+H.hueColor = function(t){
+	var h = clamp01(t) * 360;
+	if(h >= 360) h = 359.999;
+	return H.hsvToColor(h, 1, 1, 255);
+};
+
+// SV 方块：s 水平 0–1，v 垂直 1–0（上亮下暗）
+H.svFromXY = function(x, y, w, h){
+	w = num(w, 1);
+	h = num(h, 1);
+	if(w < 1) w = 1;
+	if(h < 1) h = 1;
+	x = num(x, 0);
+	y = num(y, 0);
+	var s = clamp01(x / w);
+	var v = clamp01(1 - y / h);
+	return s, v;
+};
+
+H.xyFromSV = function(s, v, w, h){
+	// s/v 为 0 时假值合并会算错，必须用 repair 后的数值
+	if(s === null) s = 0;
+	if(v === null) v = 0;
+	if(w === null || w < 1) w = 1;
+	if(h === null || h < 1) h = 1;
+	return clamp01(s) * w, (1 - clamp01(v)) * h;
+};
+
+// 线性位置 0–1（水平条 x / 垂直条 y）
+H.ratioFromPos = function(p, size){
+	size = num(size, 0);
+	if(size < 1) return 0;
+	p = num(p, 0);
+	return clamp01(p / size);
+};
+
+// 模式顺序与索引共用同一份数据，避免切换规则漂移。
+H.modes = ["hex","aardio","rgb","hsl","oklab","oklch","lab","lch"];
+var modeIndex = {hex=1;aardio=2;rgb=3;hsl=4;oklab=5;oklch=6;lab=7;lch=8};
+
+H.isMode = function(mode){
+	return type(mode) == type.string && modeIndex[mode] !== null;
+};
+
+H.nextMode = function(mode){
+	var index = modeIndex[mode] : 0;
+	return H.modes[index % #H.modes + 1];
+};
+
+H.prevMode = function(mode){
+	var index = modeIndex[mode] : 1;
+	index -= 1;
+	if(index < 1) index = #H.modes;
+	return H.modes[index];
+};
+
+// showAlpha=false（紧凑）时不返回 a 字段
+H.modeFields = function(mode, showAlpha){
+	var withA = true;
+	if(showAlpha === false || showAlpha === 0) withA = false;
+	if(mode == "rgb"){
+		if(withA) return { "r"; "g"; "b"; "a" };
+		return { "r"; "g"; "b" };
+	}
+	if(mode == "hsl"){
+		if(withA) return { "h"; "s"; "l"; "a" };
+		return { "h"; "s"; "l" };
+	}
+
+	if(mode == "oklab" || mode == "lab"){
+		if(withA) return { "l"; "a2"; "b"; "a" };
+		return { "l"; "a2"; "b" };
+	}
+	if(mode == "oklch" || mode == "lch"){
+		if(withA) return { "l"; "c"; "h"; "a" };
+		return { "l"; "c"; "h" };
+	}
+	if(mode == "aardio") return { "aardio" };
+	return { "hex" };
+};
+
+// 当前模式下的字段名（含 a2 等非单字母名）
+H.isFieldName = function(name, mode, showAlpha){
+	if(type(name) != type.string) return false;
+	var names = H.modeFields(mode, showAlpha);
+	for(i=1; #names; 1){
+		if(names[i] == name) return true;
+	}
+	return false;
+};
+
+H.modeLabel = function(mode){
+	return ..string.upper(mode : "hex");
+};
+
+H.modeFieldLabel = function(mode, field){
+	if(mode == "rgb"){
+		if(field == "r") return "R";
+		if(field == "g") return "G";
+		if(field == "b") return "B";
+		return "A";
+	}
+	if(mode == "hsl"){
+		if(field == "h") return "H";
+		if(field == "s") return "S";
+		if(field == "l") return "L";
+		return "A";
+	}
+
+	if(mode == "oklch" || mode == "lch"){
+		if(field == "l") return "L";
+		if(field == "c") return "C";
+		if(field == "h") return "H";
+		return "A";
+	}
+	if(mode == "oklab" || mode == "lab"){
+		if(field == "l") return "L";
+		if(field == "a2") return "a";
+		if(field == "b") return "b";
+		return "A";
+	}
+	if(mode == "aardio") return "aardio";
+	return "十六进制";
+};
+
+// 当前颜色在指定模式下的字段显示值（精度对齐 uiColorKit.format.PREC）
+H.fieldValues = function(mode, h, s, v, a){
+	var color = H.hsvToColor(h, s, v, a * 255);
+	if(mode == "aardio") return { aardio = ..uiColorKit.format.toAardio(color) };
+	if(mode == "rgb"){
+		var r, g, b = H.hsvToRgb(h, s, v);
+		return {
+			r = tostring(r);
+			g = tostring(g);
+			b = tostring(b);
+			a = tostring(floor(a * 255 + 0.5));
+		};
+	}
+	if(mode == "hsl"){
+		var hh, ss, ll = ..uiColorKit.format.getHsl(color);
+		return {
+			h = ..uiColorKit.format.fmtTrim(hh, ..uiColorKit.format.PREC.hue);
+			s = ..uiColorKit.format.fmtTrim(ss * 100, ..uiColorKit.format.PREC.pct);
+			l = ..uiColorKit.format.fmtTrim(ll * 100, ..uiColorKit.format.PREC.pct);
+			a = tostring(floor(a * 100 + 0.5));
+		};
+	}
+
+	if(mode == "oklab"){
+		var oL, oa, ob = ..uiColorKit.format.getOklab(color);
+		return {
+			l = ..uiColorKit.format.fmtTrim(oL, ..uiColorKit.format.PREC.oklab);
+			a2 = ..uiColorKit.format.fmtTrim(oa, ..uiColorKit.format.PREC.oklab);
+			b = ..uiColorKit.format.fmtTrim(ob, ..uiColorKit.format.PREC.oklab);
+			a = tostring(floor(a * 100 + 0.5));
+		};
+	}
+	if(mode == "oklch"){
+		var oL, oC, oH = ..uiColorKit.format.getOklch(color);
+		return {
+			l = ..uiColorKit.format.fmtTrim(oL, ..uiColorKit.format.PREC.oklab);
+			c = ..uiColorKit.format.fmtTrim(oC, ..uiColorKit.format.PREC.oklab);
+			h = ..uiColorKit.format.fmtTrim(oH, ..uiColorKit.format.PREC.okH);
+			a = tostring(floor(a * 100 + 0.5));
+		};
+	}
+	if(mode == "lab"){
+		var lL, la, lb = ..uiColorKit.format.getLab(color);
+		return {
+			l = ..uiColorKit.format.fmtTrim(lL, ..uiColorKit.format.PREC.lab);
+			a2 = ..uiColorKit.format.fmtTrim(la, ..uiColorKit.format.PREC.lab);
+			b = ..uiColorKit.format.fmtTrim(lb, ..uiColorKit.format.PREC.lab);
+			a = tostring(floor(a * 100 + 0.5));
+		};
+	}
+	if(mode == "lch"){
+		var lL, lC, lH = ..uiColorKit.format.getLch(color);
+		return {
+			l = ..uiColorKit.format.fmtTrim(lL, ..uiColorKit.format.PREC.lab);
+			c = ..uiColorKit.format.fmtTrim(lC, ..uiColorKit.format.PREC.lab);
+			h = ..uiColorKit.format.fmtTrim(lH, ..uiColorKit.format.PREC.hue);
+			a = tostring(floor(a * 100 + 0.5));
+		};
+	}
+	return {
+		hex = ..uiColorKit.format.toHex(color, a < 1);
+	};
+};
+
+// 把字段值写回 h,s,v,a（mode=hex 时 field="hex"）
+// 成功路径统一 repairHsv，避免 360 色相流入手柄
+H.applyField = function(mode, field, text, h, s, v, a){
+	// a 入参 0–1，出参 0–1
+	var ok = function(nh, ns, nv, na01){
+		if(na01 === null) na01 = a;
+		var rh, rs, rv, ra = H.repairHsv(nh, ns, nv, na01 * 255);
+		return rh, rs, rv, ra / 255, true;
+	};
+	if(mode == "hex" || mode == "aardio" || field == "hex" || field == "aardio"){
+		var c = ..uiColorKit.format.parse(text);
+		if(c === null) return h, s, v, a, false;
+		var nh, ns, nv, na = H.colorToHsv(c);
+		return ok(nh, ns, nv, na / 255);
+	}
+	// 允许小数（lab / oklch / hsl）
+	var n = tonumber(text);
+	if(n === null) return h, s, v, a, false;
+	var color = H.hsvToColor(h, s, v, a * 255);
+	if(mode == "rgb"){
+		var r, g, b = H.hsvToRgb(h, s, v);
+		if(field == "r") r = clamp255(n);
+		elseif(field == "g") g = clamp255(n);
+		elseif(field == "b") b = clamp255(n);
+		else return ok(h, s, v, clamp(n, 0, 255) / 255);
+		var nh, ns, nv = H.rgbToHsv(r, g, b);
+		return ok(nh, ns, nv, a);
+	}
+	if(mode == "hsl"){
+		var hh, ss, ll = ..uiColorKit.format.getHsl(color);
+		if(field == "h") hh = clamp(n, 0, 360);
+		elseif(field == "s") ss = clamp(n, 0, 100) / 100;
+		elseif(field == "l") ll = clamp(n, 0, 100) / 100;
+		else return ok(h, s, v, clamp(n, 0, 100) / 100);
+		var nc = ..uiColorKit.format.hsl(hh, ss, ll);
+		var nh, ns, nv = H.colorToHsv(nc);
+		return ok(nh, ns, nv, a);
+	}
+
+	if(mode == "oklab"){
+		var oL, oa, ob = ..uiColorKit.format.getOklab(color);
+		if(field == "l") oL = clamp(n, 0, 1);
+		elseif(field == "a2") oa = n;
+		elseif(field == "b") ob = n;
+		else return ok(h, s, v, clamp(n, 0, 100) / 100);
+		var nc = ..uiColorKit.format.oklab(oL, oa, ob);
+		var nh, ns, nv = H.colorToHsv(nc);
+		return ok(nh, ns, nv, a);
+	}
+	if(mode == "oklch"){
+		var oL, oC, oH = ..uiColorKit.format.getOklch(color);
+		if(field == "l") oL = clamp(n, 0, 1);
+		elseif(field == "c") oC = ..math.abs(n);
+		elseif(field == "h") oH = n % 360;
+		else return ok(h, s, v, clamp(n, 0, 100) / 100);
+		var nc = ..uiColorKit.format.oklch(oL, oC, oH);
+		var nh, ns, nv = H.colorToHsv(nc);
+		return ok(nh, ns, nv, a);
+	}
+	if(mode == "lab"){
+		var lL, la, lb = ..uiColorKit.format.getLab(color);
+		if(field == "l") lL = clamp(n, 0, 100);
+		elseif(field == "a2") la = n;
+		elseif(field == "b") lb = n;
+		else return ok(h, s, v, clamp(n, 0, 100) / 100);
+		var nc = ..uiColorKit.format.lab(lL, la, lb);
+		var nh, ns, nv = H.colorToHsv(nc);
+		return ok(nh, ns, nv, a);
+	}
+	if(mode == "lch"){
+		var lL, lC, lH = ..uiColorKit.format.getLch(color);
+		if(field == "l") lL = clamp(n, 0, 100);
+		elseif(field == "c") lC = ..math.abs(n);
+		elseif(field == "h") lH = n % 360;
+		else return ok(h, s, v, clamp(n, 0, 100) / 100);
+		var nc = ..uiColorKit.format.lch(lL, lC, lH);
+		var nh, ns, nv = H.colorToHsv(nc);
+		return ok(nh, ns, nv, a);
+	}
+	return h, s, v, a, false;
+};
+
+// 命中区域：sv / hue / alpha / swatch / 当前格式字段 / modeUp / modeDown / none
+// 手柄优先，确保点在手柄边缘也能开始拖拽。
+H.hitTest = function(x, y, L, s, v, h, a){
+	if(!L) return "none";
+
+	// —— 手柄命中（优先于轨道矩形）——
+	// SV 圆手柄：外接约 10px，留 4px 抓取余量
+	if(s !== null && v !== null){
+		var hx, hy = H.xyFromSV(s, v, L.svW, L.svH);
+		var cx = L.svX + hx;
+		var cy = L.svY + hy;
+		var dx = x - cx;
+		var dy = y - cy;
+		if(dx * dx + dy * dy <= 14 * 14) return "sv";
+	}
+	// 色相滑块
+	if(L.hueVisible && h !== null){
+		var hy2 = L.hueY + (h / 360) * L.hueH;
+		if(x >= L.hueX - 8 && x < L.hueX + L.hueW + 8
+			&& y >= hy2 - 10 && y < hy2 + 10) return "hue";
+	}
+	// 透明度滑块（含手柄上下外溢）
+	if(L.alphaVisible && a !== null){
+		var ax = L.alphaX + clamp01(a) * L.alphaW;
+		if(x >= ax - 10 && x < ax + 10
+			&& y >= L.alphaY - 8 && y < L.alphaY + L.alphaH + 8) return "alpha";
+	}
+
+	// —— 轨道与静态区 ——
+	if(x >= L.svX && x < L.svX + L.svW && y >= L.svY && y < L.svY + L.svH) return "sv";
+	if(L.hueVisible && x >= L.hueX && x < L.hueX + L.hueW && y >= L.hueY && y < L.hueY + L.hueH) return "hue";
+	if(L.alphaVisible && x >= L.alphaX && x < L.alphaX + L.alphaW && y >= L.alphaY && y < L.alphaY + L.alphaH) return "alpha";
+	if(L.swatchVisible && x >= L.swatchX && x < L.swatchX + L.swatchW && y >= L.swatchY && y < L.swatchY + L.swatchH) return "swatch";
+	if(L.modeUpVisible && x >= L.modeUpX && x < L.modeUpX + L.modeUpW && y >= L.modeUpY && y < L.modeUpY + L.modeUpH) return "modeUp";
+	if(L.modeDownVisible && x >= L.modeDownX && x < L.modeDownX + L.modeDownW && y >= L.modeDownY && y < L.modeDownY + L.modeDownH) return "modeDown";
+	if(L.fields && #L.fields > 0){
+		for(i=1; #L.fields; 1){
+			var f = L.fields[i];
+			if(x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h) return f.name;
+		}
+	}
+	return "none";
+};
+
+var flagOn = function(value, defaultOn){
+	if(value === null) return defaultOn !== false;
+	return value !== false && value !== 0;
+};
+
+// 布局：SV / 色相 / 透明度 / 色块 + 模式输入区
+H.layout = function(cw, ch, opt){
+	var pad = num(opt.pad, 10);
+	var gap = num(opt.gap, 10);
+	var hueW = num(opt.hueWidth, 16);
+	var barH = num(opt.barHeight, 16);
+	// 负数/0 尺寸会把面板算穿，夹到可用下限
+	if(pad < 0) pad = 0;
+	if(gap < 0) gap = 0;
+	if(hueW < 2) hueW = 2;
+	if(barH < 4) barH = 4;
+	var showInfo = flagOn(opt.showInfo, true);
+	var showAlpha = flagOn(opt.showAlpha, true);
+	var showHue = flagOn(opt.showHue, true);
+	var infoH = 0;
+	if(showInfo) infoH = 56;
+	var mode = opt.colorMode : "hex";
+
+	var innerW = cw - pad * 2;
+	var innerH = ch - pad * 2;
+	if(innerW < 40) innerW = 40;
+	if(innerH < 40) innerH = 40;
+
+	var hueVisible = showHue;
+	var alphaVisible = showAlpha;
+
+	// SV/色相手柄外溢约 10px，透明度手柄上溢 4px；额外净空避免手柄重合
+	var handleClear = 8;
+	var alphaSlot = barH + gap + handleClear;
+
+	var bottomH = 0;
+	if(alphaVisible) bottomH = bottomH + alphaSlot;
+	if(infoH > 0) bottomH = bottomH + gap + infoH;
+
+	var topH = innerH - bottomH;
+	if(topH < 40) topH = 40;
+
+	var svX = pad;
+	var svY = pad;
+	var svW = innerW;
+	var svH = topH;
+	// 无透明度时不把腾出的高度拉给 SV，与有透明度时同高，多余留白
+	if(!alphaVisible){
+		var svHRef = innerH - alphaSlot;
+		if(infoH > 0) svHRef = svHRef - (gap + infoH);
+		if(svHRef < 40) svHRef = 40;
+		if(svH > svHRef) svH = svHRef;
+	}
+	var hueX = 0, hueY = 0, hueW2 = 0, hueH = 0;
+	if(hueVisible){
+		svW = innerW - hueW - gap;
+		if(svW < 40) svW = 40;
+		hueX = svX + svW + gap;
+		hueY = svY;
+		hueW2 = hueW;
+		hueH = svH;
+	}
+
+	var alphaX = pad, alphaY = 0, alphaW = innerW, alphaH = 0;
+	if(alphaVisible){
+		// 与 SV 面板拉开手柄净空，避免透明度手柄和 SV 手柄叠在一起
+		alphaY = svY + svH + gap + handleClear;
+		alphaH = barH;
+	}
+
+	var infoY = 0;
+	var swatchVisible = false, swatchX = 0, swatchY = 0, swatchW = 28, swatchH = 28;
+	var fields = {};
+	var modeUpVisible = false, modeUpX = 0, modeUpY = 0, modeUpW = 0, modeUpH = 0;
+	var modeDownVisible = false, modeDownX = 0, modeDownY = 0, modeDownW = 0, modeDownH = 0;
+	if(infoH > 0){
+		infoY = pad + innerH - infoH;
+		swatchVisible = true;
+		swatchX = pad;
+		swatchY = infoY;
+		var modeW = 22;
+		var fieldH = 28;
+		var fieldY = infoY;
+		// 字段区域从色块右侧开始，格式标识绘制在色块下方，不占用字段宽度。
+		var areaX = pad + swatchW + gap;
+		var areaW = innerW - swatchW - gap - modeW - gap;
+		if(areaW < 60) areaW = 60;
+
+		var names = H.modeFields(mode, showAlpha);
+		var n = #names;
+		var fgap = 6;
+		if(n == 1){
+			fields[1] = { name = names[1]; x = areaX; y = fieldY; w = areaW; h = fieldH };
+		}
+		else {
+			var fw = (areaW - fgap * (n - 1)) / n;
+			if(fw < 28) fw = 28;
+			for(i=1; n; 1){
+				fields[i] = {
+					name = names[i];
+					x = areaX + (i - 1) * (fw + fgap);
+					y = fieldY;
+					w = fw;
+					h = fieldH;
+				};
+			}
+		}
+		modeUpVisible = true;
+		modeDownVisible = true;
+		var modeX = areaX + areaW + gap;
+		modeUpX = modeX;
+		modeUpY = infoY + 2;
+		modeUpW = modeW;
+		modeUpH = 12;
+		modeDownX = modeX;
+		modeDownY = infoY + 14;
+		modeDownW = modeW;
+		modeDownH = 12;
+	}
+
+	return {
+		pad = pad;
+		gap = gap;
+		colorMode = mode;
+		svX = svX;
+		svY = svY;
+		svW = svW;
+		svH = svH;
+		hueVisible = hueVisible;
+		hueX = hueX;
+		hueY = hueY;
+		hueW = hueW2;
+		hueH = hueH;
+		alphaVisible = alphaVisible;
+		alphaX = alphaX;
+		alphaY = alphaY;
+		alphaW = alphaW;
+		alphaH = alphaH;
+		infoVisible = infoH > 0;
+		infoY = infoY;
+		infoH = infoH;
+		swatchVisible = swatchVisible;
+		swatchX = swatchX;
+		swatchY = swatchY;
+		swatchW = swatchW;
+		swatchH = swatchH;
+		fields = fields;
+		modeUpVisible = modeUpVisible;
+		modeUpX = modeUpX;
+		modeUpY = modeUpY;
+		modeUpW = modeUpW;
+		modeUpH = modeUpH;
+		modeDownVisible = modeDownVisible;
+		modeDownX = modeDownX;
+		modeDownY = modeDownY;
+		modeDownW = modeDownW;
+		modeDownH = modeDownH;
+	};
+};
+
+// 选项归一
+// 注意：aardio 中 0/false/null 是假值，`a:b` 会把 0 吞成默认值；
+// 读 color 必须用 === null，不能用 o.color : fallback
+H.normalizeOptions = function(opt){
+	var o = opt : {};
+	var theme = resolveTheme(o.theme);
+	var color = o.color;
+	// 仅 null 视为未传；0x00000000 是合法颜色，不能用 a:b 吞掉
+	if(color === null) color = 0xFF3B82F6;
+	if(type(color) == type.string){
+		var pc = ..uiColorKit.format.parse(color);
+		if(pc !== null) color = pc;
+		else color = 0xFF3B82F6;
+	}
+	if(type(color) != type.number) color = 0xFF3B82F6;
+	color = u32(color);
+	// 无 alpha 通道的 RRGGBB（高位字节为 0 且 RGB 非 0）补成不透明
+	// 完全透明黑 0x00000000：showAlpha 时保留，否则视为缺省 alpha → 不透明黑
+	if(alphaOf(color) == 0 && rgbOf(color) != 0) color = withAlpha(color, 255);
+	if(color === 0){
+		if(flagOn(o.showAlpha, true)) color = 0x00000000;
+		else color = 0xFF000000;
+	}
+
+	var h, s, v, a = H.colorToHsv(color);
+	var aa = a;
+	if(aa === null) aa = 255;
+	// 先建表再赋布尔，避免 false 在表构造里被丢掉
+	var out = {
+		theme = theme;
+		radius = num(o.radius, 10);
+		pad = num(o.pad, 10);
+		gap = num(o.gap, 10);
+		hueWidth = num(o.hueWidth, 16);
+		barHeight = num(o.barHeight, 16);
+		fontName = o.fontName : "Microsoft YaHei UI";
+		fontSize = num(o.fontSize, 12);
+		colorMode = H.isMode(o.colorMode) ? o.colorMode : "hex";
+	};
+	// h/s/v/a/color 数值 0 合法，统一建表后写回（并 repair）
+	out.color = color;
+	out.h = h;
+	out.s = s;
+	out.v = v;
+	out.a = aa / 255;
+	var rh, rs, rv, ra = repairHsv(out.h, out.s, out.v, aa);
+	out.h = rh;
+	out.s = rs;
+	out.v = rv;
+	out.a = ra / 255;
+	out.showAlpha = flagOn(o.showAlpha, true);
+	out.showHue = flagOn(o.showHue, true);
+	out.showInfo = flagOn(o.showInfo, true);
+	// 无透明度通道时强制不透明
+	if(!out.showAlpha) out.a = 1;
+	return out;
+};
+
+// ============================================================
+// 内部实现，仅供 uiColorKit.picker 使用。
+H.resolveTheme = resolveTheme;
+
+var packRGB = lambda(red,green,blue) ..uiColorKit.format.getRgbValue(..uiColorKit.format.rgb(red,green,blue));
+
+
+// 绘制辅助
+// ============================================================
+var Paint = {};
+
+Paint.checker = function(graphics, x, y, w, h, size, c1, c2){
+	if(w < 1 || h < 1) return;
+	var s = size : 8;
+	if(s < 2) s = 2;
+	var b1 = ..gdip.solidBrush(c1);
+	var b2 = ..gdip.solidBrush(c2);
+	var cols = floor(w / s) + 1;
+	var rows = floor(h / s) + 1;
+	for(r=0; rows-1; 1){
+		for(c=0; cols-1; 1){
+			var brush = ((r + c) % 2 == 0) ? b1 : b2;
+			var cx = x + c * s;
+			var cy = y + r * s;
+			var cw = s;
+			var chh = s;
+			if(cx + cw > x + w) cw = x + w - cx;
+			if(cy + chh > y + h) chh = y + h - cy;
+			if(cw > 0 && chh > 0) graphics.fillRect(brush, cx, cy, cw, chh);
+		}
+	}
+	b1.delete();
+	b2.delete();
+};
+
+// 抗锯齿圆角：先矩形铺内容，再用 Alternate 路径挖掉四角
+// fillPath 跟随 smoothingMode 抗锯齿；setClipPath 不会
+Paint.cutRoundCorners = function(graphics, x, y, w, h, radius, bgColor){
+	if(radius <= 0 || w < 4 || h < 4) return;
+	if(bgColor === null) return;
+	var prev = graphics.smoothingMode;
+	graphics.smoothingMode = 4/*_GdipSmoothingModeAntiAlias*/;
+	// 外框 + 圆角矩形（Alternate：重叠偶数次不填）→ 只填四角
+	var p = ..gdip.path(0/*_GdipFillModeAlternate*/);
+	p.addRect(x - 1, y - 1, w + 2, h + 2);
+	p.addRoundRect(x, y, w, h, radius);
+	var b = ..gdip.solidBrush(bgColor);
+	graphics.fillPath(b, p);
+	b.delete();
+	p.delete();
+	graphics.smoothingMode = prev;
+};
+
+// 每个 picker 独占缓存，避免一个实例释放另一个实例正在使用的位图。
+var createPanelCache = function(){
+	var cache = {
+		sv = null; svKey = "";
+		hue = null; hueKey = "";
+		alpha = null; alphaKey = "";
+	};
+	cache.clear = function(){
+		if(owner.sv) owner.sv.delete();
+		if(owner.hue) owner.hue.delete();
+		if(owner.alpha) owner.alpha.delete();
+		owner.sv = null;
+		owner.hue = null;
+		owner.alpha = null;
+		owner.svKey = "";
+		owner.hueKey = "";
+		owner.alphaKey = "";
+	};
+	return cache;
+};
+
+// 颜色线性插值（0–1）
+var lerpRGB = function(c1, c2, t){
+	if(t < 0) t = 0;
+	if(t > 1) t = 1;
+	var r1, g1, b1 = ..uiColorKit.format.getRgb(c1);
+	var r2, g2, b2 = ..uiColorKit.format.getRgb(c2);
+	return ..uiColorKit.format.rgb(
+		floor(r1 + (r2 - r1) * t + 0.5),
+		floor(g1 + (g2 - g1) * t + 0.5),
+		floor(b1 + (b2 - b1) * t + 0.5)
+	);
+};
+
+// SV 条带：白→色相（水平）+ 透明→黑（竖直），对齐 Chrome DevTools
+Paint.svFieldStrips = function(graphics, x, y, w, h, pure){
+	var denomW = w - 1;
+	if(denomW < 1) denomW = 1;
+	var i;
+	for(i=0; w-1; 1){
+		var c = lerpRGB(0xFFFFFFFF, pure, i / denomW);
+		var b = ..gdip.solidBrush(c);
+		graphics.fillRect(b, x + i, y, 2, h);
+		b.delete();
+	}
+	var denomH = h - 1;
+	if(denomH < 1) denomH = 1;
+	for(i=0; h-1; 1){
+		var a = floor(i * 255 / denomH + 0.5);
+		if(a < 0) a = 0;
+		if(a > 255) a = 255;
+		var b2 = ..gdip.solidBrush(a * 0x1000000);
+		graphics.fillRect(b2, x, y + i, w, 2);
+		b2.delete();
+	}
+};
+
+// SV 方块（对齐 Chrome DevTools）：位图按色相缓存
+Paint.svField = function(graphics, cache, x, y, w, h, hue, radius, cornerBg){
+	if(w < 2 || h < 2) return;
+	var iw = floor(w + 0.5);
+	var ih = floor(h + 0.5);
+	if(iw < 2) iw = 2;
+	if(ih < 2) ih = 2;
+
+	var hq = floor(hue * 2 + 0.5);
+	var key = tostring(hq) ++ "x" ++ tostring(iw) ++ "x" ++ tostring(ih);
+	var pure = H.hueColor(hq / 2 / 360);
+
+	if(!cache.sv || cache.svKey != key){
+		if(cache.sv) cache.sv.delete();
+		cache.sv = null;
+		var bmp = null;
+		var g = null;
+		try {
+			bmp = ..gdip.bitmap(iw, ih);
+			if(bmp) g = bmp.getGraphics();
+		}
+		catch(e){
+			bmp = null;
+			g = null;
+		}
+		if(!bmp || !g){
+			Paint.svFieldStrips(graphics, x, y, w, h, pure);
+			Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+			return;
+		}
+		g.smoothingMode = 3/*None*/;
+		Paint.svFieldStrips(g, 0, 0, iw, ih, pure);
+		g.delete();
+		cache.sv = bmp;
+		cache.svKey = key;
+	}
+
+	graphics.drawImage(cache.sv, x, y);
+	Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+};
+
+// 色相条：静态彩虹，按尺寸缓存位图
+Paint.hueBar = function(graphics, cache, x, y, w, h, vertical, radius, cornerBg){
+	if(w < 2 || h < 2) return;
+	var iw = floor(w + 0.5);
+	var ih = floor(h + 0.5);
+	if(iw < 2) iw = 2;
+	if(ih < 2) ih = 2;
+	var key = (vertical ? "v" : "h") ++ "x" ++ tostring(iw) ++ "x" ++ tostring(ih);
+	if(!cache.hue || cache.hueKey != key){
+		if(cache.hue) cache.hue.delete();
+		var bmp = ..gdip.bitmap(iw, ih);
+		if(!bmp) return;
+		var g = bmp.getGraphics();
+		if(!g){
+			if(bmp.delete) bmp.delete();
+			return;
+		}
+		g.smoothingMode = 3/*None*/;
+		if(vertical){
+			var denom = ih - 1;
+			if(denom < 1) denom = 1;
+			for(i=0; ih-1; 1){
+				var c = H.hueColor(i / denom);
+				var b = ..gdip.solidBrush(c);
+				g.fillRect(b, 0, i, iw, 2);
+				b.delete();
+			}
+		}
+		else {
+			var denom2 = iw - 1;
+			if(denom2 < 1) denom2 = 1;
+			for(i=0; iw-1; 1){
+				var c2 = H.hueColor(i / denom2);
+				var b2 = ..gdip.solidBrush(c2);
+				g.fillRect(b2, i, 0, 2, ih);
+				b2.delete();
+			}
+		}
+		g.delete();
+		cache.hue = bmp;
+		cache.hueKey = key;
+	}
+	graphics.drawImage(cache.hue, x, y);
+	Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+};
+
+// 透明度渐变条带：当前 RGB 从透明→不透明
+// 1px 逐列绘制，避免 2px 重叠导致 GDI+ 双重混合出条带
+Paint.alphaStrips = function(graphics, x, y, w, h, rgb){
+	var iw = floor(w + 0.5);
+	var ih = floor(h + 0.5);
+	if(iw < 1 || ih < 1) return;
+	var base = rgbOf(rgb);
+	// 单列：直接画不透明端，避免 denom 退化成透明
+	if(iw == 1){
+		var b0 = ..gdip.solidBrush(0xFF000000 + base);
+		graphics.fillRect(b0, x, y, 1, ih);
+		b0.delete();
+		return;
+	}
+	var denom = iw - 1;
+	for(i=0; iw-1; 1){
+		var a = floor(i * 255 / denom + 0.5);
+		if(a < 0) a = 0;
+		if(a > 255) a = 255;
+		var col = a * 0x1000000 + base;
+		var b = ..gdip.solidBrush(col);
+		graphics.fillRect(b, x + i, y, 1, ih);
+		b.delete();
+	}
+};
+
+// 透明度条：棋盘 + 当前 RGB 透明→不透明（按 rgb + 主题棋盘色缓存）
+Paint.alphaBar = function(graphics, cache, x, y, w, h, rgb, c1, c2, radius, cornerBg, edgeColor){
+	if(w < 2 || h < 2) return;
+	var iw = floor(w + 0.5);
+	var ih = floor(h + 0.5);
+	if(iw < 2) iw = 2;
+	if(ih < 2) ih = 2;
+	// 主题棋盘色必须进 key，否则切主题会残留旧色
+	var chA = c1;
+	var chB = c2;
+	if(chA === null) chA = 0xFF3A3D48;
+	if(chB === null) chB = 0xFF2A2C34;
+	var key = tostring(rgb) ++ "x" ++ tostring(iw) ++ "x" ++ tostring(ih)
+		++ "x" ++ tostring(chA) ++ "x" ++ tostring(chB);
+	if(!cache.alpha || cache.alphaKey != key){
+		if(cache.alpha) cache.alpha.delete();
+		var bmp = null;
+		var g = null;
+		try {
+			bmp = ..gdip.bitmap(iw, ih);
+			if(bmp) g = bmp.getGraphics();
+		}
+		catch(e){
+			bmp = null;
+			g = null;
+		}
+		if(!bmp || !g){
+			// 直接画到目标
+			Paint.checker(graphics, x, y, w, h, 4, chA, chB);
+			Paint.alphaStrips(graphics, x, y, w, h, rgb);
+			Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+			Paint.trackEdge(graphics, x, y, w, h, radius, edgeColor);
+			return;
+		}
+		g.smoothingMode = 3/*None*/;
+		// 小棋盘更接近 DevTools：4px 格，对比柔和
+		Paint.checker(g, 0, 0, iw, ih, 4, chA, chB);
+		Paint.alphaStrips(g, 0, 0, iw, ih, rgb);
+		g.delete();
+		cache.alpha = bmp;
+		cache.alphaKey = key;
+	}
+	graphics.drawImage(cache.alpha, x, y);
+	Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+	Paint.trackEdge(graphics, x, y, w, h, radius, edgeColor);
+};
+
+// 滑轨外描边：1px 内描边，与面板分离
+Paint.trackEdge = function(graphics, x, y, w, h, radius, edgeColor){
+	if(w < 4 || h < 4) return;
+	var r = radius;
+	if(r === null || r < 0) r = 0;
+	if(r > h / 2) r = h / 2;
+	var ec = edgeColor;
+	if(ec === null) ec = 0x22000000;
+	if(alphaOf(ec) < 1) return;
+	var p = ..gdip.pen(ec, 1);
+	if(r > 0) graphics.drawRoundRect(p, ..RECTF(x + 0.5, y + 0.5, w - 1, h - 1), r);
+	else graphics.drawRect(p, x + 0.5, y + 0.5, w - 1, h - 1);
+	p.delete();
+};
+
+// SV 手柄（DevTools 风格）：白环 + 当前色芯 + 轻投影
+// 只用 fillCircle 分层，不用 drawCircle（GdipDrawEllipse 在部分路径会返回 ValueOverflow）
+Paint.ring = function(graphics, cx, cy, r, ringColor, fillColor, ringW){
+	var rw = ringW : 2;
+	if(r < 2) return;
+	// 坐标/半径取整，避免异常几何
+	cx = floor(cx + 0.5);
+	cy = floor(cy + 0.5);
+	r = floor(r + 0.5);
+	if(cx < -256 || cy < -256 || cx > 4096 || cy > 4096) return;
+	if(r < 2 || r > 128) return;
+	rw = floor(rw + 0.5);
+	if(rw < 1) rw = 1;
+	if(rw > 8) rw = 8;
+	var outerR = r + rw;
+	var midR = r + floor(rw / 2);
+	var coreR = ..math.max(r - floor(rw / 2), 1);
+	// 轻投影
+	var shadow = ..gdip.solidBrush(0x33000000);
+	graphics.fillCircle(shadow, cx, cy + 1, outerR);
+	shadow.delete();
+	// 深色外缘（替代 drawCircle 描边）
+	var edge = ..gdip.solidBrush(0x33000000);
+	graphics.fillCircle(edge, cx, cy, outerR);
+	edge.delete();
+	// 白环
+	var outer = ..gdip.solidBrush(ringColor);
+	graphics.fillCircle(outer, cx, cy, midR);
+	outer.delete();
+	// 当前色芯：强制不透明 RGB，避免透明色画出空心、看起来点不中
+	if(fillColor !== null){
+		var core = fillColor;
+		if(alphaOf(core) < 255) core = 0xFF000000 + rgbOf(core);
+		var inner = ..gdip.solidBrush(core);
+		graphics.fillCircle(inner, cx, cy, coreR);
+		inner.delete();
+	}
+};
+
+// 垂直滑块手柄（色相）
+// 坐标取整 + 范围校验，避免 GDI+ path 对极端几何返回 ValueOverflow
+Paint.vThumb = function(graphics, x, y, w, cy, fillColor){
+	var th = 12;
+	var tw = w + 6;
+	x = floor(x + 0.5);
+	cy = floor(cy + 0.5);
+	if(cy < -64 || cy > 4096) return;
+	if(tw < 4 || tw > 256) return;
+	var tx = x - 3;
+	var ty = cy - floor(th / 2);
+	var white = ..gdip.solidBrush(0xFFFFFFFF);
+	graphics.fillRoundRect(white, ..RECTF(tx, ty, tw, th), 6);
+	white.delete();
+	var shadow = ..gdip.pen(0x55000000, 1);
+	graphics.drawRoundRect(shadow, ..RECTF(tx + 0.5, ty + 0.5, tw - 1, th - 1), 6);
+	shadow.delete();
+	if(fillColor !== null){
+		var core = ..gdip.solidBrush(fillColor);
+		graphics.fillRoundRect(core, ..RECTF(tx + 3, ty + 3, tw - 6, th - 6), 3);
+		core.delete();
+	}
+};
+
+// 水平滑块手柄（透明度）
+// 白环 + 细棋盘玻璃底 + 当前色，让半透明透出层次更干净
+Paint.hThumb = function(graphics, x, y, w, h, cx, fillColor){
+	var tw = 14;
+	var th = h + 8;
+	cx = floor(cx + 0.5);
+	y = floor(y + 0.5);
+	if(cx < -64 || cx > 4096) return;
+	if(th < 6 || th > 256) return;
+	var tx = cx - floor(tw / 2);
+	var ty = y - 4;
+
+	// 轻投影
+	var shadow = ..gdip.solidBrush(0x33000000);
+	graphics.fillRoundRect(shadow, ..RECTF(tx, ty + 1, tw, th), 7);
+	shadow.delete();
+	// 白环（外圈）
+	var white = ..gdip.solidBrush(0xFFFFFFFF);
+	graphics.fillRoundRect(white, ..RECTF(tx, ty, tw, th), 7);
+	white.delete();
+	var edge = ..gdip.pen(0x33000000, 1);
+	graphics.drawRoundRect(edge, ..RECTF(tx + 0.5, ty + 0.5, tw - 1, th - 1), 7);
+	edge.delete();
+
+	if(fillColor !== null) Paint.thumbCore(graphics, tx + 3, ty + 3, tw - 6, th - 6, fillColor);
+};
+
+// 手柄色芯：高对比细棋盘玻璃底 + 颜色按 alpha 透出
+// 小尺寸下用 2px 亮底棋盘，避免暗棋盘把色相吃掉（色芯是微缩透明预览）
+Paint.thumbCore = function(graphics, x, y, w, h, fillColor){
+	if(w < 3 || h < 3) return;
+	var a = alphaOf(fillColor);
+	var rgb = rgbOf(fillColor);
+	// 亮色玻璃棋盘：半透明色透出后仍能读出色相；全透明时呈干净“玻璃”
+	Paint.checker(graphics, x, y, w, h, 2, 0xFFF0F1F3, 0xFFFFFFFF);
+	// 按真实 alpha 透出；极低透明度略抬预览下限，保证色相可辨
+	var pa = a;
+	if(a > 0 && pa < 48) pa = 48;
+	var core = ..gdip.solidBrush(pa * 0x1000000 + rgb);
+	graphics.fillRoundRect(core, ..RECTF(x, y, w, h), 3);
+	core.delete();
+};
+
+// ============================================================
+// 控件绑定
+// ============================================================
+var bindCtrl = function(t, ctrl){
+	t.ctrl = ctrl;
+	ctrl.notify = true;
+	ctrl.text = "";
+	ctrl.tabstop = true;
+	// 与 uiColorKit.input 一致：transparent 圆角，四角透出父级
+	ctrl.transparent = true;
+	// notify=1 时 plus 默认 DLGC_BUTTON，收不到字符；要 WANTCHARS
+	ctrl.dlgCode = 0x85/*WANTCHARS|WANTALLKEYS|WANTARROWS*/;
+	if(ctrl.modifyStyle){
+		ctrl.modifyStyle(0, 0x10000/*_WS_TABSTOP*/);
+	}
+	elseif(ctrl.hwnd){
+		..win.modifyStyle(ctrl.hwnd, 0, 0x10000/*_WS_TABSTOP*/);
+	}
+
+	ctrl.onDrawBackground = function(graphics, rc, bkColor, foreColor){
+		t.painting = true;
+		try {
+			t.paint(graphics, rc);
+		}
+		catch(e){}
+		t.painting = false;
+		return true;
+	};
+
+	ctrl.onMouseDown = function(wParam, lParam){
+		t._onDown(lParam);
+	};
+
+	ctrl.onMouseMove = function(wParam, lParam){
+		t._onMove(lParam);
+	};
+
+	ctrl.onMouseUp = function(wParam, lParam){
+		t._onUp(lParam);
+	};
+
+	ctrl.onMouseLeave = function(wParam, lParam){
+		if(!t.dragging && t.hoverRegion != "none"){
+			t.hoverRegion = "none";
+			t._redraw();
+		}
+	};
+
+	ctrl.onKeyDown = function(key, msg){
+		t._onKey(key);
+	};
+
+	ctrl.wndproc = function(hwnd, message, wParam, lParam){
+		// 失捕/取消模式：拖拽必须结束，否则松手后滑块仍跟鼠标
+		if(message == 0x0215/*_WM_CAPTURECHANGED*/ || message == 0x001F/*_WM_CANCELMODE*/){
+			if(t.dragging) t._endDrag(true);
+		}
+		elseif(message == 0x08/*_WM_KILLFOCUS*/){
+			if(t.dragging) t._endDrag(true);
+		}
+	};
+};
+
+// ============================================================
+// 主类
+// ============================================================
+var class pickerView{
+	ctor(ctrl, options){
+		this.ctrl = null;
+		this.disposed = false;
+		this.cache = createPanelCache();
+		this.painting = false;
+		this.redrawing = false;
+		this.dragging = false;
+		this.dragRegion = "none";
+		this.dragX = 0;
+		this.dragY = 0;
+		this.hoverRegion = "none";
+		this.editField = null;
+		this.editBuffer = "";
+		this.editors = {};
+		this.editSyncing = false;
+		this.copyFlash = 0;
+		this.fontsReady = false;
+		this.font = null;
+		this.fontBold = null;
+		this.fmtCenter = null;
+		this.fmtLeft = null;
+
+		var raw = H.normalizeOptions(options);
+		// 布尔字段建表后赋值，避免 false 被表构造丢掉
+		this.opt = {
+			theme = raw.theme;
+			radius = raw.radius;
+			pad = raw.pad;
+			gap = raw.gap;
+			hueWidth = raw.hueWidth;
+			barHeight = raw.barHeight;
+			fontName = raw.fontName;
+			fontSize = raw.fontSize;
+			colorMode = raw.colorMode;
+		};
+		this.opt.showAlpha = true;
+		this.opt.showHue = true;
+		this.opt.showInfo = true;
+		if(raw.showAlpha === false || raw.showAlpha === 0) this.opt.showAlpha = false;
+		if(raw.showHue === false || raw.showHue === 0) this.opt.showHue = false;
+		if(raw.showInfo === false || raw.showInfo === 0) this.opt.showInfo = false;
+		// raw 字段做一次 repair，防 null 进入手柄坐标
+		var aIn = raw.a;
+		if(aIn === null) aIn = 1;
+		var rh, rs, rv, ra = H.repairHsv(raw.h, raw.s, raw.v, aIn * 255);
+		this.h = rh;
+		this.s = rs;
+		this.v = rv;
+		this.a = ra / 255;
+		if(!this.opt.showAlpha) this.a = 1;
+
+		this.onChange = null;
+		this.onInput = null;
+		this.onCommit = null;
+
+		if(ctrl) bindCtrl(this, ctrl);
+	}
+
+	attach = function(ctrl){
+		var t = owner;
+		bindCtrl(t, ctrl);
+		return t;
+	};
+
+	// ---------- 取值 ----------
+	getColor = function(){
+		var t = owner;
+		return H.hsvToColor(t.h, t.s, t.v, t.a * 255);
+	};
+
+	getRgb = function(){
+		var t = owner;
+		return H.hsvToRgb(t.h, t.s, t.v);
+	};
+
+	getHsv = function(){
+		var t = owner;
+		return t.h, t.s, t.v;
+	};
+
+	getAlpha = function(){
+		return owner.a;
+	};
+
+	getHex = function(){
+		var t = owner;
+		var withA = false;
+		if(t.opt.showAlpha !== false && t.opt.showAlpha !== 0){
+			if(t.a < 1) withA = true;
+		}
+		return ..uiColorKit.format.toHex(t.getColor(), withA);
+	};
+
+	setHex = function(hex, silent){
+		return owner.setColor(hex, silent);
+	};
+
+	// 当前模式的完整颜色文本，用于色块复制。
+	getColorText = function(){
+		var t = owner;
+		var mode = t.getColorMode();
+		var color = t.getColor();
+		if(mode == "aardio") return ..uiColorKit.format.toAardio(color);
+		var withA = t.opt.showAlpha !== false && t.opt.showAlpha !== 0 && t.a < 1;
+		return ..uiColorKit.format.toCss(color, mode, withA);
+	};
+
+	_copyText = function(text, mode){
+		var t = owner;
+		var ok = false;
+		if(..win.clip && ..win.clip.write){
+			try {
+				..win.clip.write(text);
+				ok = true;
+			}
+			catch(e){
+				ok = false;
+			}
+		}
+		t.copyFlash = ..time.tick();
+		t._redraw();
+		if(t.onCopy) t.onCopy(t, text, mode);
+		return ok;
+	};
+
+	copyColor = function(){
+		var t = owner;
+		return t._copyText(t.getColorText(), t.getColorMode());
+	};
+
+	copyHex = function(){
+		return owner._copyText(owner.getHex(), "hex");
+	};
+
+	getColorMode = function(){
+		return owner.opt.colorMode : "hex";
+	};
+
+	setColorMode = function(mode){
+		var t = owner;
+		// 仅接受 modes 中声明的模式，非法值回退到 hex。
+		if(!H.isMode(mode)) mode = "hex";
+		if(t.opt.colorMode == mode) return t;
+		t._endFieldEdit(true);
+		t.opt.colorMode = mode;
+		t._syncEditors();
+		if(t.onModeChange) t.onModeChange(t, mode);
+		t._redraw();
+		return t;
+	};
+
+	cycleColorMode = function(back){
+		var t = owner;
+		var m = t.getColorMode();
+		if(back) t.setColorMode(H.prevMode(m));
+		else t.setColorMode(H.nextMode(m));
+		return t;
+	};
+
+	// 字段显示/编辑文本（hex 含 #，与未编辑时一致）
+	_fieldText = function(field){
+		var t = owner;
+		if(field == "aardio") return ..uiColorKit.format.toAardio(t.getColor());
+		if(field == "hex") return t.getHex();
+		var vals = H.fieldValues(t.opt.colorMode, t.h, t.s, t.v, t.a);
+		return vals[field] : "";
+	};
+
+	_fieldRect = function(field){
+		var t = owner;
+		var L = t._layout();
+		if(!L.fields) return null;
+		for(i=1; #L.fields; 1){
+			var f = L.fields[i];
+			if(f.name == field) return f;
+		}
+		return null;
+	};
+
+
+	// ---------- 原生 edit 叠层（对齐 uiForm） ----------
+	// edit 几何：圆角内缩 + 单行压成一字高垂直居中
+	_fieldPlusBox = function(f){
+		var t = owner;
+		var r = t.opt.radius : 10;
+		var inset = floor(r * 0.65);
+		if(inset < 3) inset = 3;
+		var ix = f.x + inset;
+		var iw = f.w - inset * 2;
+		if(iw < 24) iw = 24;
+		var lineH = t.opt.fontSize + 4;
+		if(lineH < 16) lineH = 16;
+		var maxH = f.h - 4;
+		if(lineH > maxH) lineH = maxH;
+		var ih = lineH;
+		var iy = f.y + (f.h - ih) / 2;
+		if(iy < f.y + 1) iy = f.y + 1;
+		return ix, iy, iw, ih;
+	};
+
+	// 文字左边距对齐 plus 自绘 f.x+8
+	_textMargins = function(f){
+		var t = owner;
+		var r = t.opt.radius : 10;
+		var inset = floor(r * 0.65);
+		if(inset < 3) inset = 3;
+		var leftM = 8 - inset;
+		if(leftM < 2) leftM = 2;
+		return leftM, 6;
+	};
+
+	_placeEdit = function(edt, x, y, w, h){
+		if(!edt) return;
+		if(edt.getPos){
+			var px, py, pw, ph = edt.getPos();
+			if(px == x && py == y && pw == w && ph == h) return;
+		}
+		if(edt.setPos) edt.setPos(x, y, w, h);
+		else {
+			edt.left = x;
+			edt.top = y;
+			edt.width = w;
+			edt.height = h;
+		}
+	};
+
+	_applyEditMargins = function(edt, leftPad, rightPad){
+		if(!edt || !edt.hwnd) return;
+		var l = leftPad : 0;
+		if(l < 0) l = 0;
+		if(l > 80) l = 80;
+		var r = rightPad : 0;
+		if(r < 0) r = 0;
+		if(r > 80) r = 80;
+		::User32.SendMessage(edt.hwnd, 0x00D3/*_EM_SETMARGINS*/, 3, r * 0x10000 + l);
+	};
+
+	_paintEditorSkin = function(edt){
+		if(!edt) return;
+		var th = owner.opt.theme;
+		edt.bgcolor = th.checkerB;
+		edt.color = th.text;
+		if(edt.redraw) edt.redraw();
+	};
+
+	// 仅当前编辑字段显示 edit；必须先 show 再 SetFocus
+	_showOnlyFocusedEditor = function(){
+		var t = owner;
+		if(type(t.editors) != type.table) return;
+		for(k, edt in t.editors){
+			if(!edt) continue;
+			var want = (t.editField == k);
+			edt.hide = true;
+			if(want) edt.hide = false;
+			if(edt.hwnd) ::User32.ShowWindow(edt.hwnd, want ? 5/*_SW_SHOW*/ : 0/*_SW_HIDE*/);
+		}
+	};
+
+	_focusEditor = function(field){
+		var t = owner;
+		if(t.editSyncing) return;
+		if(type(t.editors) != type.table) return;
+		var edt = t.editors[field];
+		if(!edt) return;
+		t.editSyncing = true;
+		t.editField = field;
+		// 必须写入当前值：拖拽改色后 edit 可能是旧文本（如无 AA 的 HEX），
+		// 焦点进入时若沿用旧文，确认会把透明度冲掉
+		var text = t._fieldText(field);
+		if(edt.text != text) edt.text = text;
+		t.editBuffer = ..string.replace(text, "@#", "");
+		t._showOnlyFocusedEditor();
+		t._paintEditorSkin(edt);
+		if(edt.setFocus) edt.setFocus();
+		if(edt.hwnd){
+			::User32.SetFocus(edt.hwnd);
+			// 全选：直接键入覆盖，也可点击定位/拖选
+			::User32.SendMessage(edt.hwnd, 0x00B1/*_EM_SETSEL*/, 0, -1);
+		}
+		t.editSyncing = false;
+		t._redraw();
+	};
+
+	// 按当前布局创建/摆放/显隐各字段 edit（模式切换后重建）
+	_syncEditors = function(){
+		var t = owner;
+		if(!t.ctrl || !t.ctrl.addCtrl) return;
+		if(type(t.editors) != type.table) t.editors = {};
+
+		var th = t.opt.theme;
+		var fontH = 0 - t.opt.fontSize;
+		var L = t._layout();
+		if(!L.fields) return;
+		var seen = {};
+
+		for(i=1; #L.fields; 1){
+			var f = L.fields[i];
+			seen[f.name] = true;
+			var ix, iy, iw, ih = t._fieldPlusBox(f);
+
+			var edt = t.editors[f.name];
+			if(!edt){
+				var param = {
+					cls = "edit";
+					left = ix;
+					top = iy;
+					right = ix + iw;
+					bottom = iy + ih;
+					text = t._fieldText(f.name);
+					font = LOGFONT(h = fontH);
+					color = th.text;
+					bgcolor = th.checkerB;
+					edge = 0;
+					tabstop = 0;
+					hide = 1;
+					z = 50;
+					// 触发 translateCommand，EN_SETFOCUS/CHANGE 才会到 onFocusGot/onChange
+					oncommand = function(){};
+				};
+				// 仅限制真正的数值分量；hex 与 aardio 需要允许 0x 前缀及 A-F。
+				if(f.name != "hex" && f.name != "aardio") param.num = 1;
+
+				var bag = t.ctrl.addCtrl({ param });
+				if(!bag) continue;
+				edt = bag[1];
+				if(!edt) continue;
+
+				var mL, mR = t._textMargins(f);
+				t._applyEditMargins(edt, mL, mR);
+				t._paintEditorSkin(edt);
+				edt.hide = true;
+				if(edt.hwnd) ::User32.ShowWindow(edt.hwnd, 0/*_SW_HIDE*/);
+				t.editors[f.name] = edt;
+
+				var fname = f.name;
+				var view = t;
+				var edtRef = edt;
+				edt.onChange = function(){
+					if(view.editSyncing) return;
+					if(edtRef.text !== null) view.editBuffer = edtRef.text;
+				};
+				edt.onFocusGot = function(){
+					if(view.editSyncing) return;
+					view.editField = fname;
+					view.editBuffer = edtRef.text : "";
+					view._showOnlyFocusedEditor();
+					view._paintEditorSkin(edtRef);
+					view._redraw();
+				};
+				edt.onFocusLost = function(){
+					if(view.editSyncing) return;
+					// hide/show 切换字段抖动：焦点仍在 edit 上则忽略
+					if(edtRef.hwnd && ::User32.GetFocus() == edtRef.hwnd) return;
+					if(view.editField) view._endFieldEdit(true);
+				};
+				// Enter 应用 / Esc 取消 / Tab 下一字段
+				var oldAccel = edt.defaultTranslateAccelerator;
+				edt.defaultTranslateAccelerator = function(msg){
+					if(msg && msg.message == 0x100/*_WM_KEYDOWN*/){
+						if(msg.wParam == 13/*ENTER*/){ view._endFieldEdit(true); return true; }
+						if(msg.wParam == 27/*ESC*/){ view._endFieldEdit(false); return true; }
+						if(msg.wParam == 9/*TAB*/){
+							view._focusNextField(fname);
+							return true;
+						}
+					}
+					if(oldAccel) return oldAccel(msg);
+				};
+			}
+			else {
+				// 未在该字段编辑时，把最新值写回 edit
+				if(t.editField != f.name && edt.text != t._fieldText(f.name)){
+					t.editSyncing = true;
+					edt.text = t._fieldText(f.name);
+					t.editSyncing = false;
+				}
+			}
+
+			t._placeEdit(edt, ix, iy, iw, ih);
+			var mL2, mR2 = t._textMargins(f);
+			t._applyEditMargins(edt, mL2, mR2);
+			t._paintEditorSkin(edt);
+			var wantShow = (t.editField == f.name);
+			edt.hide = true;
+			if(wantShow) edt.hide = false;
+			if(edt.hwnd) ::User32.ShowWindow(edt.hwnd, wantShow ? 5 : 0);
+		}
+
+		// 清理模式切换后不再存在的字段
+		for(k, edt in t.editors){
+			if(!seen[k]){
+				if(edt){
+					edt.onChange = null;
+					edt.onFocusGot = null;
+					edt.onFocusLost = null;
+					edt.defaultTranslateAccelerator = null;
+					if(edt.destroy) edt.destroy();
+					elseif(edt.close) edt.close();
+				}
+				t.editors[k] = null;
+			}
+		}
+	};
+
+	_focusNextField = function(fromField){
+		var t = owner;
+		var L = t._layout();
+		if(!L.fields || #L.fields < 1) return;
+		var names = {};
+		for(i=1; #L.fields; 1) names[i] = L.fields[i].name;
+		var cur = 0;
+		for(i=1; #names; 1){
+			if(names[i] == fromField){ cur = i; break; }
+		}
+		if(cur < 1) cur = 1;
+		var next = cur + 1;
+		if(next > #names) next = 1;
+		t._endFieldEdit(true);
+		t.beginFieldEdit(names[next]);
+	};
+
+	_disposeEditors = function(){
+		var t = owner;
+		if(type(t.editors) != type.table) return;
+		for(k, edt in t.editors){
+			if(edt){
+				edt.onChange = null;
+				edt.onFocusGot = null;
+				edt.onFocusLost = null;
+				edt.defaultTranslateAccelerator = null;
+				if(edt.destroy) edt.destroy();
+				elseif(edt.close) edt.close();
+			}
+		}
+		t.editors = {};
+	};
+
+	dispose = function(){
+		var t = owner;
+		t._disposeEditors();
+		t.editField = null;
+		t.editBuffer = "";
+		if(t.font) t.font.delete();
+		if(t.fontBold) t.fontBold.delete();
+		if(t.fmtCenter) t.fmtCenter.delete();
+		if(t.fmtLeft) t.fmtLeft.delete();
+		t.font = null;
+		t.fontBold = null;
+		t.fmtCenter = null;
+		t.fmtLeft = null;
+		t.fontsReady = false;
+		if(t.cache) t.cache.clear();
+		if(t.ctrl){
+			t.ctrl.onDrawBackground = null;
+			t.ctrl.onMouseDown = null;
+			t.ctrl.onMouseMove = null;
+			t.ctrl.onMouseUp = null;
+			t.ctrl.onMouseLeave = null;
+			t.ctrl.onKeyDown = null;
+			t.ctrl.wndproc = null;
+		}
+		t.ctrl = null;
+		t.disposed = true;
+		return t;
+	};
+
+	beginFieldEdit = function(field){
+		var t = owner;
+		t._endFieldEdit(true);
+		t.editField = field;
+		var text = t._fieldText(field);
+		t.editBuffer = ..string.replace(text, "@#", "");
+		t._syncEditors();
+		t._focusEditor(field);
+		return t;
+	};
+
+	endFieldEdit = function(apply){
+		return owner._endFieldEdit(apply !== false);
+	};
+
+	isEditing = function(){
+		var t = owner;
+		return t.editField !== null;
+	};
+
+	// ---------- 设置 ----------
+	setColor = function(color, silent){
+		var t = owner;
+		if(type(color) == type.string){
+			var pc = ..uiColorKit.format.parse(color);
+			if(pc === null) return t;
+			color = pc;
+		}
+		if(type(color) != type.number) return t;
+		color = ..uiColorKit.format.parse(color);
+		// 0x00000000 / 0x00RRGGBB：有 alpha 通道时保留透明度
+		if(alphaOf(color) == 0 && rgbOf(color) != 0 && (t.opt.showAlpha === false || t.opt.showAlpha === 0)){
+			color = withAlpha(color, 255);
+		}
+		if(color === 0 && (t.opt.showAlpha === false || t.opt.showAlpha === 0)) color = 0xFF000000;
+		var h, s, v, a = H.colorToHsv(color);
+		// 无彩色没有自身色相，沿用当前 SV 面板色相。
+		if(s <= 0) h = t.h;
+		// 纯黑的饱和度不可由 RGB 反推；同步时只落到底部，横向位置保持不变。
+		if(v <= 0) s = t.s;
+		var rh, rs, rv, ra = H.repairHsv(h, s, v, a);
+		t.h = rh;
+		t.s = rs;
+		t.v = rv;
+		t.a = ra / 255;
+		// 紧凑模式忽略透明度
+		if(t.opt.showAlpha === false || t.opt.showAlpha === 0) t.a = 1;
+		if(!silent) t._emit();
+		t._syncEditors();
+		t._redraw();
+		return t;
+	};
+
+	setHsv = function(h, s, v, silent){
+		var t = owner;
+		var rh, rs, rv, ra = H.repairHsv(h, s, v, t.a * 255);
+		t.h = rh;
+		t.s = rs;
+		t.v = rv;
+		if(!silent) t._emit();
+		t._redraw();
+		return t;
+	};
+
+	setAlpha = function(a, silent){
+		var t = owner;
+		if(type(a) != type.number) return t;
+		a = clamp01(a);
+		if(a === t.a) return t;
+		t.a = a;
+		if(!silent) t._emit();
+		t._syncEditors();
+		t._redraw();
+		return t;
+	};
+
+	setTheme = function(theme){
+		var t = owner;
+		t.opt.theme = resolveTheme(theme);
+		if(type(t.editors) == type.table){
+			for(k, edt in t.editors) t._paintEditorSkin(edt);
+		}
+		t._redraw();
+		return t;
+	};
+
+	setOptions = function(opt){
+		var t = owner;
+		if(!opt) return t;
+		var needEditors = false;
+		if(opt.theme !== null) t.opt.theme = resolveTheme(opt.theme);
+		if(opt.showAlpha !== null){
+			var sa = true;
+			if(opt.showAlpha === false || opt.showAlpha === 0) sa = false;
+			if(t.opt.showAlpha != sa){
+				t.opt.showAlpha = sa;
+				needEditors = true;
+				if(!sa) t.a = 1;
+			}
+		}
+		if(opt.showHue !== null){
+			t.opt.showHue = true;
+			if(opt.showHue === false || opt.showHue === 0) t.opt.showHue = false;
+		}
+		if(opt.showInfo !== null){
+			var si = true;
+			if(opt.showInfo === false || opt.showInfo === 0) si = false;
+			if(t.opt.showInfo != si){
+				t.opt.showInfo = si;
+				needEditors = true;
+			}
+		}
+		if(opt.colorMode !== null) t.setColorMode(opt.colorMode);
+		if(opt.radius !== null) t.opt.radius = num(opt.radius, 10);
+		if(opt.pad !== null) t.opt.pad = num(opt.pad, 10);
+		if(opt.gap !== null) t.opt.gap = num(opt.gap, 10);
+		if(opt.hueWidth !== null) t.opt.hueWidth = num(opt.hueWidth, 16);
+		if(opt.barHeight !== null) t.opt.barHeight = num(opt.barHeight, 16);
+		if(opt.fontName !== null){
+			t.opt.fontName = opt.fontName;
+			t.fontsReady = false;
+			if(type(t.editors) == type.table){
+				for(k, edt in t.editors){
+					if(edt) edt.font = LOGFONT(h = 0 - t.opt.fontSize);
+				}
+			}
+		}
+		if(opt.fontSize !== null){
+			t.opt.fontSize = num(opt.fontSize, 12);
+			t.fontsReady = false;
+			if(type(t.editors) == type.table){
+				for(k, edt in t.editors){
+					if(edt) edt.font = LOGFONT(h = 0 - t.opt.fontSize);
+				}
+			}
+		}
+		if(opt.color !== null) t.setColor(opt.color, true);
+		if(needEditors) t._syncEditors();
+		if(type(t.editors) == type.table){
+			for(k, edt in t.editors) t._paintEditorSkin(edt);
+		}
+		t._redraw();
+		return t;
+	};
+
+	refresh = function(){
+		var t = owner;
+		t._redraw();
+		return t;
+	};
+
+	redraw = function(){
+		return owner._redraw();
+	};
+
+	paint = function(graphics, rc){
+		if(!graphics) return;
+		owner.painting = true;
+		owner._paint(graphics, rc);
+		owner.painting = false;
+		return true;
+	};
+
+	// ============================================================
+	// 内部
+	// ============================================================
+	_clientSize = function(){
+		var t = owner;
+		if(t.ctrl) return t.ctrl.clientWidth, t.ctrl.clientHeight;
+		return 0, 0;
+	};
+
+	_layout = function(){
+		var t = owner;
+		var cw, ch = t._clientSize();
+		return H.layout(cw, ch, t.opt);
+	};
+
+	_mousePos = function(lParam){
+		var x = ::LOWORD(lParam);
+		var y = ::HIWORD(lParam);
+		if(x > 32767) x = x - 65536;
+		if(y > 32767) y = y - 65536;
+		return x, y;
+	};
+
+	_emit = function(){
+		var t = owner;
+		if(t.onChange) t.onChange(t, t.getColor());
+	};
+
+	_redraw = function(){
+		var t = owner;
+		if(t.ctrl && !t.painting && !t.redrawing){
+			t.redrawing = true;
+			try {
+				if(t.ctrl.redraw) t.ctrl.redraw();
+				elseif(t.ctrl.redrawTransparent) t.ctrl.redrawTransparent();
+			}
+			catch(e){}
+			t.redrawing = false;
+		}
+	};
+
+	_applyRegion = function(region, x, y, commit){
+		var t = owner;
+		var L = t._layout();
+		if(region == "sv"){
+			var s, v = H.svFromXY(x - L.svX, y - L.svY, L.svW, L.svH);
+			t.s = s;
+			t.v = v;
+			if(t.onInput) t.onInput(t, "sv", s, v);
+		}
+		elseif(region == "hue"){
+			var r = H.ratioFromPos(y - L.hueY, L.hueH);
+			t.h = r * 360;
+			if(t.h >= 360) t.h = 359.999;
+			if(t.onInput) t.onInput(t, "hue", t.h);
+		}
+		elseif(region == "alpha"){
+			var ar = H.ratioFromPos(x - L.alphaX, L.alphaW);
+			t.a = ar;
+			if(t.onInput) t.onInput(t, "alpha", ar);
+		}
+		else {
+			return;
+		}
+		t._emit();
+		if(commit && t.onCommit) t.onCommit(t, t.getColor());
+		t._redraw();
+	};
+
+	_onDown = function(lParam){
+		var t = owner;
+		var x, y = t._mousePos(lParam);
+		var L = t._layout();
+		var region = H.hitTest(x, y, L, t.s, t.v, t.h, t.a);
+		if(t.editField && region != t.editField){
+			t._endFieldEdit(true);
+		}
+		if(region == "none") return;
+		if(region == "swatch"){
+			t.copyColor();
+			return;
+		}
+		if(region == "modeUp"){
+			t.cycleColorMode(false);
+			return;
+		}
+		if(region == "modeDown"){
+			t.cycleColorMode(true);
+			return;
+		}
+		// 字段：当前模式任一字段（含 l / c / a2 等，不能只写死 hex|r|g|b|h|s|v|a）
+		if(H.isFieldName(region, t.opt.colorMode, t.opt.showAlpha)){
+			// 已在编辑该字段：保持原生 edit 的选区/光标
+			if(t.editField != region) t.beginFieldEdit(region);
+			else t._focusEditor(region);
+			return;
+		}
+		t.dragging = true;
+		t.dragRegion = region;
+		t.hoverRegion = region;
+		t.dragX = x;
+		t.dragY = y;
+		// 捕获鼠标：在控件外松开也能收到 MouseUp
+		if(t.ctrl && t.ctrl.capture !== null) t.ctrl.capture = true;
+		t._applyRegion(region, x, y, false);
+		if(t.ctrl && t.ctrl.setFocus) t.ctrl.setFocus();
+	};
+
+	_onMove = function(lParam){
+		var t = owner;
+		var x, y = t._mousePos(lParam);
+		if(t.dragging){
+			t.dragX = x;
+			t.dragY = y;
+			t._applyRegion(t.dragRegion, x, y, false);
+			return;
+		}
+		var L = t._layout();
+		var region = H.hitTest(x, y, L, t.s, t.v, t.h, t.a);
+		if(region != t.hoverRegion){
+			t.hoverRegion = region;
+			if(t.ctrl) t.ctrl.cursor = region == "none" ? "arrow" : "hand";
+			t._redraw();
+		}
+	};
+
+	// 结束拖拽：先清状态再放捕获，避免 CAPTURECHANGED 重入
+	_endDrag = function(commit){
+		var t = owner;
+		if(!t.dragging){
+			if(t.ctrl && t.ctrl.capture !== null) t.ctrl.capture = false;
+			return;
+		}
+		var region = t.dragRegion;
+		var x = t.dragX;
+		var y = t.dragY;
+		t.dragging = false;
+		t.dragRegion = "none";
+		if(t.ctrl && t.ctrl.capture !== null) t.ctrl.capture = false;
+		if(commit && region != "none") t._applyRegion(region, x, y, true);
+		// 拖完刷新字段文本（含透明度）
+		t._syncEditors();
+	};
+
+	_onUp = function(lParam){
+		var t = owner;
+		if(!t.dragging){
+			if(t.ctrl && t.ctrl.capture !== null) t.ctrl.capture = false;
+			return;
+		}
+		var x, y = t._mousePos(lParam);
+		t.dragX = x;
+		t.dragY = y;
+		t._endDrag(true);
+	};
+
+	_endFieldEdit = function(apply){
+		var t = owner;
+		if(!t.editField) return t;
+		var field = t.editField;
+		var buf = t.editBuffer;
+		if(type(t.editors) == type.table && t.editors[field] && t.editors[field].text !== null){
+			buf = t.editors[field].text;
+		}
+
+		t.editSyncing = true;
+		t.editField = null;
+		t.editBuffer = "";
+		t._showOnlyFocusedEditor();
+		t.editSyncing = false;
+
+		if(apply && buf !== null && #buf > 0){
+			var nh, ns, nv, na, ok = H.applyField(t.opt.colorMode, field, buf, t.h, t.s, t.v, t.a);
+			if(ok){
+				t.h = nh;
+				t.s = ns;
+				t.v = nv;
+				t.a = na;
+				// 紧凑模式不保留透明度
+				if(t.opt.showAlpha === false || t.opt.showAlpha === 0) t.a = 1;
+				t._emit();
+				if(t.onCommit) t.onCommit(t, t.getColor());
+			}
+		}
+		t._redraw();
+		return t;
+	};
+
+	_onKey = function(key){
+		var t = owner;
+		if(t.editField) return;
+		// 37-40：左右调 S，上下调 V
+		var stepS = 0.02;
+		var stepV = 0.02;
+		if(key == 37){ t.s = clamp01(t.s - stepS); }
+		elseif(key == 39){ t.s = clamp01(t.s + stepS); }
+		elseif(key == 38){ t.v = clamp01(t.v + stepV); }
+		elseif(key == 40){ t.v = clamp01(t.v - stepV); }
+		else return;
+		t._emit();
+		t._redraw();
+	};
+
+	_ensureFonts = function(){
+		var t = owner;
+		if(t.fontsReady) return;
+		if(t.font) t.font.delete();
+		if(t.fontBold) t.fontBold.delete();
+		if(t.fmtCenter) t.fmtCenter.delete();
+		if(t.fmtLeft) t.fmtLeft.delete();
+
+		t.font = ..gdip.font(t.opt.fontName, t.opt.fontSize, 0, 2/*_GdipUnitPixel*/);
+		t.fontBold = ..gdip.font(t.opt.fontName, t.opt.fontSize + 1, 1/*_GdipFontStyleBold*/, 2);
+
+		t.fmtCenter = ..gdip.stringFormat();
+		t.fmtCenter.align = 1;
+		t.fmtCenter.lineAlign = 1;
+		t.fmtCenter.trimming = 3;
+		t.fmtCenter.flags = 4096;
+
+		t.fmtLeft = ..gdip.stringFormat();
+		t.fmtLeft.align = 0;
+		t.fmtLeft.lineAlign = 1;
+		t.fmtLeft.trimming = 3;
+		t.fmtLeft.flags = 4096;
+
+		t.fontsReady = true;
+	};
+
+	_paint = function(graphics, rc){
+		var t = owner;
+		if(!graphics) return;
+		var cw = t.ctrl ? t.ctrl.clientWidth : 0;
+		var ch = t.ctrl ? t.ctrl.clientHeight : 0;
+		if(rc && (cw < 2 || ch < 2)){
+			var x0,y0,w0,h0 = rc.xywh();
+			cw = w0;
+			ch = h0;
+		}
+		if(cw < 2 || ch < 2) return;
+
+		graphics.smoothingMode = 4/*_GdipSmoothingModeAntiAlias*/;
+		graphics.textRenderingHint = 4/*_GdipTextRenderingHintAntiAliasGridFit*/;
+		t._ensureFonts();
+
+		var th = t.opt.theme;
+		var L = H.layout(cw, ch, t.opt);
+		var radius = t.opt.radius;
+
+		// 与 input 一致：只画圆角面板，四角 transparent 透出父级
+		var bg = ..gdip.solidBrush(th.surface);
+		if(radius > 0) graphics.fillRoundRect(bg, ..RECTF(0, 0, cw, ch), radius);
+		else graphics.fillRect(bg, 0, 0, cw, ch);
+		bg.delete();
+		if(th.border && alphaOf(th.border) > 0){
+			var bp = ..gdip.pen(th.border, 1);
+			if(radius > 0) graphics.drawRoundRect(bp, ..RECTF(0.5, 0.5, cw - 1, ch - 1), radius);
+			else graphics.drawRect(bp, 0.5, 0.5, cw - 1, ch - 1);
+			bp.delete();
+		}
+
+		// SV / 色相 / 透明度：矩形铺色后挖抗锯齿圆角
+		Paint.svField(graphics, t.cache, L.svX, L.svY, L.svW, L.svH, t.h, 8, th.surface);
+		var hx, hy = H.xyFromSV(t.s, t.v, L.svW, L.svH);
+		var current = H.hsvToColor(t.h, t.s, t.v, 255);
+		Paint.ring(graphics, L.svX + hx, L.svY + hy, 7, th.handleRing, current, 3);
+		// 色相
+		if(L.hueVisible){
+			Paint.hueBar(graphics, t.cache, L.hueX, L.hueY, L.hueW, L.hueH, true, 6, th.surface);
+			var hueY = L.hueY + (t.h / 360) * L.hueH;
+			Paint.vThumb(graphics, L.hueX, L.hueY, L.hueW, hueY, H.hueColor(t.h / 360));
+		}
+
+		// 透明度
+		if(L.alphaVisible){
+			var r, g, b = H.hsvToRgb(t.h, t.s, t.v);
+			var rgb = packRGB(r, g, b);
+			Paint.alphaBar(graphics, t.cache, L.alphaX, L.alphaY, L.alphaW, L.alphaH, rgb, th.checkerA, th.checkerB, 6, th.surface, th.trackBorder);
+			var ax = L.alphaX + t.a * L.alphaW;
+			// 透明度手柄：低透明度时先铺棋盘再叠色，避免色芯不可见
+			Paint.hThumb(graphics, L.alphaX, L.alphaY, L.alphaW, L.alphaH, ax, withAlpha(rgb, t.a * 255));
+		}
+
+		// 底部：色块 + 模式输入区
+		if(L.infoVisible){
+			var iy = L.infoY;
+			var current2 = H.hsvToColor(t.h, t.s, t.v, t.a * 255);
+			var mode = t.opt.colorMode : "hex";
+
+			// 色块（点按复制）
+			if(L.swatchVisible){
+				Paint.checker(graphics, L.swatchX, L.swatchY, L.swatchW, L.swatchH, 6, th.checkerA, th.checkerB);
+				var prev = ..gdip.solidBrush(current2);
+				graphics.fillRoundRect(prev, ..RECTF(L.swatchX, L.swatchY, L.swatchW, L.swatchH), 6);
+				prev.delete();
+				var prevPen = ..gdip.pen(th.border, 1);
+				graphics.drawRoundRect(prevPen, ..RECTF(L.swatchX + 0.5, L.swatchY + 0.5, L.swatchW - 1, L.swatchH - 1), 6);
+				prevPen.delete();
+				if(t.copyFlash > 0 && ..time.tick() - t.copyFlash < 400){
+					var flash = ..gdip.pen(th.accent, 2);
+					graphics.drawRoundRect(flash, ..RECTF(L.swatchX + 1, L.swatchY + 1, L.swatchW - 2, L.swatchH - 2), 6);
+					flash.delete();
+				}
+			}
+
+			// 字段值
+			var vals = H.fieldValues(mode, t.h, t.s, t.v, t.a);
+			var brushText = ..gdip.solidBrush(th.text);
+			var brushLab = ..gdip.solidBrush(th.textSecondary);
+			var fieldBgB = ..gdip.solidBrush(th.checkerB);
+
+			for(i=1; #L.fields; 1){
+				var f = L.fields[i];
+				var editing = (t.editField == f.name);
+				var nativeEdit = editing && (type(t.editors) == type.table) && t.editors[f.name];
+				var hover = (t.hoverRegion == f.name);
+				var borderC = th.border;
+				if(editing) borderC = th.accent;
+				elseif(hover) borderC = th.focusRing;
+				graphics.fillRoundRect(fieldBgB, ..RECTF(f.x, f.y, f.w, f.h), 6);
+				var fp = ..gdip.pen(borderC, editing ? 1.5 : 1);
+				graphics.drawRoundRect(fp, ..RECTF(f.x + 0.5, f.y + 0.5, f.w - 1, f.h - 1), 6);
+				fp.delete();
+
+				// 原生 edit 叠层盖在字段上，不再自绘文字/光标
+				if(!nativeEdit){
+					var text;
+					if(editing){
+						text = t.editBuffer;
+						if(f.name == "hex" && #t.editBuffer < 1) text = "#";
+						if(f.name != "hex" && #t.editBuffer < 1) text = "";
+					}
+					else {
+						text = vals[f.name] : "";
+						if(f.name == "hex") text = vals.hex;
+					}
+					var font = (f.name == "hex") ? t.fontBold : t.font;
+					graphics.drawString(text, font, ..RECTF(f.x + 8, f.y, f.w - 16, f.h), t.fmtLeft, brushText);
+
+					// 编辑光标（自绘兜底）
+					if(editing){
+						var tw = ..string.len(text) * (t.opt.fontSize + 1) * 0.62;
+						var cx = f.x + 8 + tw + 1;
+						if(cx > f.x + f.w - 6) cx = f.x + f.w - 6;
+						var cp = ..gdip.pen(th.accent, 1.5);
+						graphics.drawLine(cp, cx, f.y + 7, cx, f.y + f.h - 7);
+						cp.delete();
+					}
+				}
+
+				// 字段标签
+				var lab = H.modeFieldLabel(mode, f.name);
+				graphics.drawString(lab, t.font, ..RECTF(f.x, f.y + f.h + 1, f.w, 16), t.fmtCenter, brushLab);
+			}
+
+			// 颜色格式标识：位于色块下方，与颜色分量标签同行，左侧与色块对齐。
+			graphics.drawString(H.modeLabel(mode), t.font, ..RECTF(
+				L.swatchX, L.infoY + 29, L.swatchW + L.gap + 44, 16
+			), t.fmtLeft, brushLab);
+
+			// 模式切换箭头
+			if(L.modeUpVisible){
+				var upFill = (t.hoverRegion == "modeUp") ? th.focusRing : th.textSecondary;
+				var dnFill = (t.hoverRegion == "modeDown") ? th.focusRing : th.textSecondary;
+				var ux = L.modeUpX + L.modeUpW / 2;
+				var ub = ..gdip.solidBrush(upFill);
+				graphics.fillPolygon(ub, 0,
+					ux, L.modeUpY + 3,
+					ux - 5, L.modeUpY + 9,
+					ux + 5, L.modeUpY + 9
+				);
+				ub.delete();
+				var dx = L.modeDownX + L.modeDownW / 2;
+				var db = ..gdip.solidBrush(dnFill);
+				graphics.fillPolygon(db, 0,
+					dx, L.modeDownY + 9,
+					dx - 5, L.modeDownY + 3,
+					dx + 5, L.modeDownY + 3
+				);
+				db.delete();
+			}
+
+			fieldBgB.delete();
+			brushText.delete();
+			brushLab.delete();
+		}
+
+		// hover 高亮（仅 SV/色相/透明度）
+		if(t.hoverRegion != "none" && !t.dragging){
+			var skip = (t.hoverRegion == "swatch" || t.hoverRegion == "modeUp" || t.hoverRegion == "modeDown"
+				|| H.isFieldName(t.hoverRegion, t.opt.colorMode, t.opt.showAlpha));
+			if(!skip){
+				var hx2, hy2, hw2, hh2;
+				if(t.hoverRegion == "sv"){
+					hx2 = L.svX; hy2 = L.svY; hw2 = L.svW; hh2 = L.svH;
+				}
+				elseif(t.hoverRegion == "hue"){
+					hx2 = L.hueX; hy2 = L.hueY; hw2 = L.hueW; hh2 = L.hueH;
+				}
+				elseif(t.hoverRegion == "alpha"){
+					hx2 = L.alphaX; hy2 = L.alphaY; hw2 = L.alphaW; hh2 = L.alphaH;
+				}
+				if(hw2){
+					var hp = ..gdip.pen(th.focusRing, 1.5);
+					graphics.drawRoundRect(hp, ..RECTF(hx2 - 1, hy2 - 1, hw2 + 2, hh2 + 2), 8);
+					hp.delete();
+				}
+			}
+		}
+	};
+}
+
+// 公共 API 仅保留工厂、主题和模式；实现类与内部工具保持局部。
+themes = pickerThemes;
+modes = H.modes;
+
+create = function(ctrl, options){
+	return pickerView(ctrl, options);
+};
+
+createModel = function(options){
+	return pickerView(null, options);
+};
+
+/**intellisense()
+uiColorKit.picker = plus 自绘颜色选择器，支持 SV、色相、透明度与多格式字段
+uiColorKit.picker.create(ctrl,[options]) = 绑定 plus 控件并创建选择器，返回 uiColorKitPickerView
+uiColorKit.picker.createModel([options]) = 创建无控件选择器模型，返回 uiColorKitPickerView
+uiColorKit.picker.themes = 内置 dark、light 主题表
+uiColorKit.picker.modes = 支持的 CSS 与 aardio 模式数组：hex、aardio、rgb、hsl、oklab、oklch、lab、lch；aardio 输出 0xRRGGBB 或 0xAARRGGBB
+end intellisense**/
+
+/**intellisense(!uiColorKitPickerOptions)
+color = 初始颜色，可指定 0xAARRGGBB 或 CSS 颜色字符串
+colorMode = 初始字段模式：hex、aardio、rgb、hsl、oklab、oklch、lab、lch；aardio 输出 0xRRGGBB 或 0xAARRGGBB
+showAlpha = 是否显示透明度，默认为 true
+showHue = 是否显示色相条，默认为 true
+showInfo = 是否显示颜色字段，默认为 true
+theme = dark、light 或自定义主题表
+radius = 面板圆角半径，默认为 10
+pad = 内容边距，默认为 10
+gap = 控件间距，默认为 10
+hueWidth = 色相条宽度，默认为 16
+barHeight = 透明度条高度，默认为 16
+fontName = 字段字体名称
+fontSize = 字段字体大小，默认为 12
+end intellisense**/
+
+/**intellisense(!uiColorKitPickerView)
+getColor() = 当前 0xAARRGGBB
+setColor(color,[silent]) = 设颜色 0xAARRGGBB 或 CSS 串，第二参 silent=true 不触发 onChange
+setHex(hex,[silent]) = 同 setColor，入参为 HEX 字符串
+getRgb() = 返回 red,green,blue
+getHsv() = 返回 hue,saturation,value（hue 0–360，其余 0–1）
+setHsv(hue,saturation,value,[silent]) = 设 HSV，第四参 silent
+getAlpha() = 返回透明度 0–1
+setAlpha(alpha,[silent]) = 设透明度 0–1
+getHex() = 输出 CSS #RRGGBB 或 #RRGGBBAA
+getColorText() = 输出当前颜色模式的完整颜色文本
+copyColor() = 按当前颜色模式复制颜色文本到剪贴板
+copyHex() = 复制 HEX 到剪贴板
+getColorMode() = 返回当前模式 hex|aardio|rgb|hsl|oklab|oklch|lab|lch
+setColorMode(mode) = 切换颜色模式，不改变颜色
+cycleColorMode([back]) = 循环颜色模式；back=true 时反向
+beginFieldEdit(field) = 进入字段编辑
+endFieldEdit([apply]) = 结束编辑；apply=true 时应用
+isEditing() = 判断是否正在编辑字段
+setTheme(theme) = 设置 dark、light 或主题表
+setOptions(options) = 批量更新颜色选择器选项
+onChange = 颜色变更回调（view,color）
+onInput = 拖拽中回调（view,region,value 等）
+onCommit = 拖拽结束或字段应用（view,color）
+onCopy = 复制颜色文本后回调（view,text,mode）
+onModeChange = 模式切换后回调（view,mode）
+refresh() = 刷新显示
+redraw() = 重绘
+dispose() = 释放编辑框与字体资源
+end intellisense**/

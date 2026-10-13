@@ -1,0 +1,34 @@
+import win.ui;
+/*DSG{{*/
+mainForm = win.form(text="uiColorKit";right=247;bottom=299;border="thin")
+mainForm.add(
+doc={cls="button";text="打开文档";left=32;top=208;right=216;bottom=256;anchors={left=1;top=1;right=1;bottom=1};z=3};
+extlib={cls="button";text="生成扩展库";left=32;top=48;right=216;bottom=96;anchors={left=1;top=1;right=1};z=1};
+test={cls="button";text="运行demo";left=32;top=128;right=216;bottom=176;anchors={left=1;top=1;right=1;bottom=1};z=2}
+)
+/*}}*/
+
+mainForm.extlib.oncommand = function(id,event){
+	
+	var extlib = mainForm.loadForm("~\tools\IDE\extlib.aardio");
+		extlib.editLibName.text = "uiColorKit";
+		extlib.show();
+}
+
+mainForm.test.oncommand = function(id,event){
+	
+	var test = mainForm.loadForm("\res\demo\ui-colorkit-demo.aardio");
+		test.show();
+
+}
+
+mainForm.doc.oncommand = function(id,event){
+
+	var frmChild = mainForm.loadForm("\dlg\doc.aardio");
+		frmChild.show();
+
+		
+}
+
+mainForm.show();
+return win.loopMessage();

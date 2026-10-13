@@ -1,0 +1,420 @@
+/*
+	uiColorKit 综合演示 — colorFormat + uiColorPicker + uiColorField 合并库
+
+	运行：在 aardio IDE 中打开本文件按 F5
+	依赖：工程 lib/uiColorKit
+
+	左侧：颜色选择器（SV / 色相 / 透明度 / 多格式输入）
+	中上：颜色输入框（点击弹出 picker，关闭提交）
+	右侧：七种浏览器兼容 CSS 格式实时换算（点行复制）
+	右下：HSV / CMYK 色彩空间分量（仅换算，不作为 CSS）
+
+	主题：深色 / 浅色，按钮与格式行自绘圆角描边，浅色下保证对比度。
+*/
+import win.ui;
+import gdip;
+import gdip.solidBrush;
+import gdip.pen;
+import gdip.path;
+import win.clip;
+/*DSG{{*/
+var winform = win.form(text="uiColorKit · 颜色一体化扩展库";right=960;bottom=640;bgcolor=0x14151A)
+winform.add(
+bg={cls="bkplus";left=0;top=0;right=960;bottom=640;anchors={left=1;top=1;right=1;bottom=1};bgcolor=0x14151A;z=1};
+btnCopyHex={cls="plus";text="复制 HEX";left=820;top=20;right=936;bottom=52;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=5};
+btnTheme={cls="plus";text="浅色";left=700;top=20;right=808;bottom=52;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=4};
+fldA={cls="plus";left=360;top=152;right=600;bottom=192;bgcolor=0x000000;notify=1;tabstop=1;transparent=1;z=10};
+fldB={cls="plus";left=360;top=236;right=600;bottom=276;bgcolor=0x000000;notify=1;tabstop=1;transparent=1;z=12};
+lbField={cls="plus";text="颜色输入框（点击弹出选择器）";left=360;top=96;right=600;bottom=116;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=8};
+lbFieldA={cls="plus";text="主色";left=360;top=126;right=460;bottom=146;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=9};
+lbFieldB={cls="plus";text="强调色（不含透明度）";left=360;top=210;right=520;bottom=230;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=11};
+lbFormats={cls="plus";text="浏览器兼容 CSS（点行复制）";left=640;top=96;right=880;bottom=116;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=15};
+lbHint={cls="plus";text="拖动取色 · 点色块复制 · 点输入框弹出选择器 · 右侧格式实时换算";left=24;top=52;right=660;bottom=72;color=0x9AA0A6;transparent=1;z=3};
+lbConversions={cls="plus";text="色彩空间换算（非 CSS）";left=640;top=394;right=880;bottom=414;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=26};
+lbMain={cls="plus";text="颜色选择器";left=24;top=96;right=200;bottom=116;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=6};
+lbPreview={cls="plus";text="预览";left=360;top=300;right=440;bottom=320;color=0x6B7280;font=LOGFONT(h=-11);transparent=1;z=13};
+lbStatus={cls="plus";text="就绪 · 拖动选择器取色";left=24;top=596;right=936;bottom=620;anchors={left=1;bottom=1};color=0x6B7280;transparent=1;z=25};
+lbTitle={cls="plus";text="Color Kit";left=24;top=16;right=320;bottom=48;color=0xF2F4F8;font=LOGFONT(h=-22;weight=700);transparent=1;z=2};
+picker={cls="plus";left=24;top=122;right=320;bottom=500;bgcolor=0x000000;notify=1;tabstop=1;z=7};
+preview={cls="plus";left=360;top=326;right=600;bottom=420;bgcolor=0x000000;transparent=1;z=14};
+
+rowHex={cls="plus";text="#3B82F6";left=640;top=122;right=936;bottom=150;bgcolor=0x22232B;color=0xF2F4F8;font=LOGFONT(h=-13;weight=700);notify=1;tabstop=1;z=16};
+rowHsl={cls="plus";text="hsl(…)";left=640;top=198;right=936;bottom=226;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=18};
+
+rowLab={cls="plus";text="lab(…)";left=640;top=306;right=936;bottom=334;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=23};
+rowLch={cls="plus";text="lch(…)";left=640;top=342;right=936;bottom=370;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=24};
+rowOklab={cls="plus";text="oklab(…)";left=640;top=234;right=936;bottom=262;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=21};
+rowOklch={cls="plus";text="oklch(…)";left=640;top=270;right=936;bottom=298;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=22};
+rowRgb={cls="plus";text="rgb(…)";left=640;top=162;right=936;bottom=190;bgcolor=0x22232B;color=0xF2F4F8;notify=1;tabstop=1;z=17};
+rowHsv={cls="plus";text="HSV";left=640;top=420;right=936;bottom=448;bgcolor=0x22232B;color=0xF2F4F8;font=LOGFONT(h=-12);z=27};
+rowCmyk={cls="plus";text="CMYK";left=640;top=456;right=936;bottom=484;bgcolor=0x22232B;color=0xF2F4F8;font=LOGFONT(h=-12);z=28}
+)
+/*}}*/
+
+import uiColorKit;
+
+// ============================================================
+// 调色板（浅色保证可读对比，深色保持原风格）
+// ============================================================
+var PAL = {
+	dark = {
+		mode = "dark";
+		// page 用 0xRRGGBB，winform.bgcolor 不能带 alpha
+		page = 0x14151A;
+		surface = 0xFF22232B;
+		surfaceHover = 0xFF2A2C36;
+		surfaceActive = 0xFF1C1E26;
+		border = 0xFF343644;
+		text = 0xFFF2F4F8;
+		textSecondary = 0xFF9AA0A6;
+		textMuted = 0xFF6B7280;
+		accent = 0xFF6B9CFF;
+		checkerA = 0xFF2A2C34;
+		checkerB = 0xFF3A3D48;
+	};
+	light = {
+		mode = "light";
+		page = 0xF3F4F6;
+		surface = 0xFFFFFFFF;
+		surfaceHover = 0xFFF8FAFC;
+		surfaceActive = 0xFFEEF2F7;
+		border = 0xFFE2E8F0;
+		text = 0xFF1F2329;
+		textSecondary = 0xFF4B5563;
+		textMuted = 0xFF6B7280;
+		accent = 0xFF3B82F6;
+		checkerA = 0xFFE8EAED;
+		checkerB = 0xFFF7F8FA;
+	};
+};
+
+var themeMode = "dark";
+// 初始颜色与主输入框、选择器保持一致
+var current = 0xFF3B82F6;
+var rowHover = "";
+var syncingA = false;
+
+var pal = function(){
+	if(themeMode == "light") return PAL.light;
+	return PAL.dark;
+};
+
+// 0xRRGGBB → 0xAARRGGBB（gdip 画笔用）
+var argb = function(c){
+	if(c > 0xFFFFFF) return c;
+	return 0xFF000000 + c;
+};
+
+// ============================================================
+// 自绘：圆角面（按钮 / 格式行）
+// 与 input 一致：transparent + 只画圆角，四角透出页面
+// ============================================================
+var paintCard = function(ctrl, radius, hoverName){
+	ctrl.hoverName = hoverName;
+	ctrl.transparent = true;
+	ctrl.onDrawBackground = function(graphics, rc, bkColor, foreColor){
+		graphics.smoothingMode = 4;
+		var x, y, w, h = rc.xywh();
+		if(w < 2 || h < 2) return true;
+		var p = pal();
+		var bg = p.surface;
+		if(hoverName && rowHover == hoverName) bg = p.surfaceHover;
+
+		var bb = ..gdip.solidBrush(bg);
+		if(radius > 0) graphics.fillRoundRect(bb, ..RECTF(0, 0, w, h), radius);
+		else graphics.fillRect(bb, 0, 0, w, h);
+		bb.delete();
+
+		var bp = ..gdip.pen(p.border, 1);
+		if(radius > 0) graphics.drawRoundRect(bp, ..RECTF(0.5, 0.5, w - 1, h - 1), radius);
+		else graphics.drawRect(bp, 0.5, 0.5, w - 1, h - 1);
+		bp.delete();
+		return true;
+	};
+	ctrl.redraw();
+};
+
+var redrawHover = function(){
+	for(i=1; #rowNames; 1){
+		var r = winform[rowNames[i]];
+		if(r && r.redraw) r.redraw();
+	}
+	for(i=1; #btnNames; 1){
+		var b = winform[btnNames[i]];
+		if(b && b.redraw) b.redraw();
+	}
+};
+
+var bindHover = function(ctrl, name){
+	ctrl.onMouseMove = function(wParam, lParam){
+		if(rowHover != name){
+			rowHover = name;
+			redrawHover();
+		}
+	};
+	ctrl.onMouseLeave = function(wParam, lParam){
+		if(rowHover == name){
+			rowHover = "";
+			redrawHover();
+		}
+	};
+};
+
+// ============================================================
+// 预览块：与 input 色块一致
+// transparent + 圆角 clip 内画棋盘/颜色，四角透出页面
+// ============================================================
+var paintPreview = function(){
+	var color = current;
+	var pv = winform.preview;
+	pv.onDrawBackground = function(graphics, rc, bkColor, foreColor){
+		graphics.smoothingMode = 4;
+		var x, y, w, h = rc.xywh();
+		if(w < 2 || h < 2) return true;
+		var p = pal();
+		var radius = 12;
+
+		// 圆角裁剪：内容只画在圆角内，四角 transparent 透出父级
+		var st = graphics.save();
+		var cpath = ..gdip.path();
+		cpath.addRoundRect(0, 0, w, h, radius);
+		graphics.setClipPath(cpath);
+		cpath.delete();
+
+		var s = 10;
+		var b1 = ..gdip.solidBrush(p.checkerA);
+		var b2 = ..gdip.solidBrush(p.checkerB);
+		var cols = ..math.floor(w / s) + 1;
+		var rows = ..math.floor(h / s) + 1;
+		for(rr=0; rows-1; 1){
+			for(cc=0; cols-1; 1){
+				var brush = ((rr + cc) % 2 == 0) ? b1 : b2;
+				graphics.fillRect(brush, cc * s, rr * s, s + 1, s + 1);
+			}
+		}
+		b1.delete();
+		b2.delete();
+		// 当前色（可带透明度，棋盘透出）
+		var fill = ..gdip.solidBrush(color);
+		graphics.fillRect(fill, 0, 0, w, h);
+		fill.delete();
+		graphics.restore(st);
+
+		// 描边（同 input：restore 后画圆角边）
+		var fp = ..gdip.pen(p.border, 1);
+		graphics.drawRoundRect(fp, ..RECTF(0.5, 0.5, w - 1, h - 1), radius);
+		fp.delete();
+		return true;
+	};
+	pv.redraw();
+};
+
+// ============================================================
+// 格式区 / 按钮刷新
+// ============================================================
+var rowNames = {
+	"rowHex"; "rowRgb"; "rowHsl"; "rowOklab"; "rowOklch"; "rowLab"; "rowLch";
+};
+var conversionNames = { "rowHsv"; "rowCmyk" };
+var btnNames = { "btnTheme"; "btnCopyHex" };
+
+var applyColor = function(color, source){
+	current = color;
+	var hex = uiColorKit.format.toHex(color);
+	winform.rowHex.text = hex;
+	winform.rowRgb.text = uiColorKit.format.toCss(color, "rgb");
+	winform.rowHsl.text = uiColorKit.format.toCss(color, "hsl");
+	winform.rowOklab.text = uiColorKit.format.toCss(color, "oklab");
+	winform.rowOklch.text = uiColorKit.format.toCss(color, "oklch");
+	winform.rowLab.text = uiColorKit.format.toCss(color, "lab");
+	winform.rowLch.text = uiColorKit.format.toCss(color, "lch");
+
+	var h, s, v = uiColorKit.format.getHsv(color);
+	winform.rowHsv.text = ..string.format("HSV    H %.1f°    S %.1f%%    V %.1f%%", h, s * 100, v * 100);
+	var c, m, y, k = uiColorKit.format.getCmyk(color);
+	winform.rowCmyk.text = ..string.format("CMYK   C %.1f%%   M %.1f%%   Y %.1f%%   K %.1f%%", c * 100, m * 100, y * 100, k * 100);
+	paintPreview();
+	if(source) winform.lbStatus.text = source ++ "  →  " ++ hex ++ "  (0x" ++ ..string.format("%08X", color) ++ ")";
+};
+
+var copyText = function(text, tag){
+	var ok = false;
+	if(..win.clip && ..win.clip.write){
+		try {
+			..win.clip.write(text);
+			ok = true;
+		}
+		catch(e){
+			ok = false;
+		}
+	}
+	if(ok) winform.lbStatus.text = "已复制 " ++ tag ++ "  " ++ text;
+	else winform.lbStatus.text = "复制失败 " ++ tag;
+};
+
+// ============================================================
+// 控件（须在 applyTheme 之前创建，供其 upvar 引用）
+// ============================================================
+var pickerOpt = {
+	theme = "dark";
+	color = 0xFF3B82F6;
+	showAlpha = true;
+	showHue = true;
+	showInfo = true;
+	radius = 12;
+};
+var cp = uiColorKit.picker.create(winform.picker, pickerOpt);
+
+var fA = uiColorKit.input.create(winform.fldA, {
+	color = 0xFF3B82F6;
+	theme = "dark";
+});
+
+var fB = uiColorKit.input.create(winform.fldB, {
+	color = 0xE5484D;
+	theme = "dark";
+	showAlpha = false;
+	colorMode = "oklch";
+});
+
+// ============================================================
+// 主题切换
+// ============================================================
+var applyTheme = function(mode){
+	themeMode = mode;
+	var p = pal();
+	var light = mode == "light";
+
+	// 窗体底色 + 全窗 bkplus 背景层（winform.bgcolor 改后不一定会重绘）
+	winform.bgcolor = p.page;
+	if(winform.bg){
+		winform.bg.background = argb(p.page);
+		if(winform.bg.redraw) winform.bg.redraw();
+	}
+
+	// 文案层级：标题 > 正文 > 次要 > 弱化
+	// 标签 transparent=1，背景跟 winform.bgcolor
+	winform.lbTitle.color = p.text;
+	winform.lbHint.color = p.textSecondary;
+	winform.lbMain.color = p.textMuted;
+	winform.lbField.color = p.textMuted;
+	winform.lbFieldA.color = p.textMuted;
+	winform.lbFieldB.color = p.textMuted;
+	winform.lbFormats.color = p.textMuted;
+	winform.lbConversions.color = p.textMuted;
+	winform.lbPreview.color = p.textMuted;
+	winform.lbStatus.color = p.textSecondary;
+
+	// 按钮（运行时 plus 用 background + 0xAARRGGBB）
+	winform.btnTheme.text = light ? "深色" : "浅色";
+	for(i=1; #btnNames; 1){
+		var b = winform[btnNames[i]];
+		if(b){
+			b.background = p.surface;
+			b.color = p.text;
+			paintCard(b, 8, btnNames[i]);
+		}
+	}
+
+	// 格式行：浅色用白卡片 + 描边，深色用 surface
+	for(i=1; #rowNames; 1){
+		var r = winform[rowNames[i]];
+		if(r){
+			r.background = p.surface;
+			r.color = p.text;
+			paintCard(r, 8, rowNames[i]);
+		}
+	}
+	// 换算行只读，不提供 CSS 式复制行为
+	for(i=1; #conversionNames; 1){
+		var r = winform[conversionNames[i]];
+		r.background = p.surface;
+		r.color = p.textSecondary;
+		paintCard(r, 8);
+	}
+
+	// HEX 行强调
+	winform.rowHex.color = p.text;
+
+	// 库控件主题（picker 为 transparent 圆角，四角透出 bkplus 页面层）
+	cp.setTheme(mode);
+	fA.setTheme(mode);
+	fB.setTheme(mode);
+
+	paintPreview();
+	winform.redraw();
+};
+
+// ============================================================
+// 事件绑定
+// ============================================================
+// 格式行点击复制
+var bindRow = function(name, space){
+	var ctrl = winform[name];
+	bindHover(ctrl, name);
+	ctrl.onMouseClick = function(wParam, lParam){
+		var text = uiColorKit.format.toCss(current, space);
+		if(space == "hex") text = uiColorKit.format.toHex(current);
+		copyText(text, name);
+	};
+};
+bindRow("rowHex", "hex");
+bindRow("rowRgb", "rgb");
+bindRow("rowHsl", "hsl");
+bindRow("rowOklab", "oklab");
+bindRow("rowOklch", "oklch");
+bindRow("rowLab", "lab");
+bindRow("rowLch", "lch");
+
+// 按钮
+bindHover(winform.btnTheme, "btnTheme");
+bindHover(winform.btnCopyHex, "btnCopyHex");
+winform.btnCopyHex.onMouseClick = function(wParam, lParam){
+	copyText(uiColorKit.format.toHex(current), "HEX");
+};
+winform.btnTheme.onMouseClick = function(wParam, lParam){
+	if(themeMode == "dark") applyTheme("light");
+	else applyTheme("dark");
+};
+
+// ---------- 控件事件 ----------
+cp.onChange = function(v, color){
+
+	applyColor(color, "picker.onChange");
+};
+
+cp.onCopy = function(v, hex){
+	winform.lbStatus.text = "已复制 " ++ hex;
+};
+
+fA.onChange = function(v, color){
+ 	if(!v.isOpen()) return;
+ 	applyColor(color, "inputA.onChange");
+ 	cp.setColor(color, true);
+};
+fA.onCommit = function(v, color){
+
+ 	applyColor(color, "inputA.onCommit");
+ 
+ 	cp.setColor(color, true);
+};
+
+fB.onChange = function(v, color){
+	if(!v.isOpen()) return;
+	applyColor(color, "inputB.onChange");
+};
+fB.onCommit = function(v, color){
+	applyColor(color, "inputB.onCommit");
+};
+
+winform.onDestroy = function(){
+	cp.dispose();
+	fA.dispose();
+	fB.dispose();
+};
+
+// 初始
+applyTheme("dark");
+applyColor(current, "就绪");
+winform.show();
+win.loopMessage();
