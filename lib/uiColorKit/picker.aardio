@@ -766,23 +766,30 @@ var lerpRGB = function(c1, c2, t){
 
 // SV 条带：白→色相（水平）+ 透明→黑（竖直），对齐 Chrome DevTools
 Paint.svFieldStrips = function(graphics, x, y, w, h, pure){
-	var denomW = w - 1;
+	// 绘图尺寸必须统一取整。布局尺寸可能是小数，直接用 w/h
+	// 做 range 上限会漏掉最后一列或最后一行，表现为右下角缝隙。
+	var iw = floor(w + 0.5);
+	var ih = floor(h + 0.5);
+	if(iw < 1 || ih < 1) return;
+	var denomW = iw - 1;
 	if(denomW < 1) denomW = 1;
 	var i;
-	for(i=0; w-1; 1){
+	for(i=0; iw-1; 1){
 		var c = lerpRGB(0xFFFFFFFF, pure, i / denomW);
 		var b = ..gdip.solidBrush(c);
-		graphics.fillRect(b, x + i, y, 2, h);
+		// 单列绘制，并明确覆盖到最后一列。
+		graphics.fillRect(b, x + i, y, 1, ih);
 		b.delete();
 	}
-	var denomH = h - 1;
+	var denomH = ih - 1;
 	if(denomH < 1) denomH = 1;
-	for(i=0; h-1; 1){
+	for(i=0; ih-1; 1){
 		var a = floor(i * 255 / denomH + 0.5);
 		if(a < 0) a = 0;
 		if(a > 255) a = 255;
 		var b2 = ..gdip.solidBrush(a * 0x1000000);
-		graphics.fillRect(b2, x, y + i, w, 2);
+		// 单行绘制，并明确覆盖到最后一行。
+		graphics.fillRect(b2, x, y + i, iw, 1);
 		b2.delete();
 	}
 };
@@ -813,8 +820,8 @@ Paint.svField = function(graphics, cache, x, y, w, h, hue, radius, cornerBg){
 			g = null;
 		}
 		if(!bmp || !g){
-			Paint.svFieldStrips(graphics, x, y, w, h, pure);
-			Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+			Paint.svFieldStrips(graphics, x, y, iw, ih, pure);
+			Paint.cutRoundCorners(graphics, x, y, iw, ih, radius, cornerBg);
 			return;
 		}
 		g.smoothingMode = 3/*None*/;
@@ -824,8 +831,11 @@ Paint.svField = function(graphics, cache, x, y, w, h, hue, radius, cornerBg){
 		cache.svKey = key;
 	}
 
-	graphics.drawImage(cache.sv, x, y);
-	Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+	// 使用与缓存位图完全一致的整数目标尺寸，避免小数布局导致右下漏绘。
+	graphics.drawImageRect(cache.sv, x, y, iw, ih);
+	Paint.cutRoundCorners(graphics, x, y, iw, ih, radius, cornerBg);
+	// 与透明度条统一：圆角外沿 + 细描边，避免 SV 面板边缘发糊。
+	Paint.trackEdge(graphics, x, y, iw, ih, radius, 0x33000000);
 };
 
 // 色相条：静态彩虹，按尺寸缓存位图
@@ -852,7 +862,7 @@ Paint.hueBar = function(graphics, cache, x, y, w, h, vertical, radius, cornerBg)
 			for(i=0; ih-1; 1){
 				var c = H.hueColor(i / denom);
 				var b = ..gdip.solidBrush(c);
-				g.fillRect(b, 0, i, iw, 2);
+				g.fillRect(b, 0, i, iw, 1);
 				b.delete();
 			}
 		}
@@ -862,7 +872,7 @@ Paint.hueBar = function(graphics, cache, x, y, w, h, vertical, radius, cornerBg)
 			for(i=0; iw-1; 1){
 				var c2 = H.hueColor(i / denom2);
 				var b2 = ..gdip.solidBrush(c2);
-				g.fillRect(b2, i, 0, 2, ih);
+				g.fillRect(b2, i, 0, 1, ih);
 				b2.delete();
 			}
 		}
@@ -870,8 +880,11 @@ Paint.hueBar = function(graphics, cache, x, y, w, h, vertical, radius, cornerBg)
 		cache.hue = bmp;
 		cache.hueKey = key;
 	}
-	graphics.drawImage(cache.hue, x, y);
-	Paint.cutRoundCorners(graphics, x, y, w, h, radius, cornerBg);
+	// 使用与缓存位图完全一致的整数目标尺寸，避免小数布局导致右下漏绘。
+	graphics.drawImageRect(cache.hue, x, y, iw, ih);
+	Paint.cutRoundCorners(graphics, x, y, iw, ih, radius, cornerBg);
+	// 色相条采用与透明度条相同的边界处理，彩虹边缘更清晰。
+	Paint.trackEdge(graphics, x, y, iw, ih, radius, 0x33000000);
 };
 
 // 透明度渐变条带：当前 RGB 从透明→不透明
@@ -2167,8 +2180,18 @@ var class pickerView{
 					hx2 = L.alphaX; hy2 = L.alphaY; hw2 = L.alphaW; hh2 = L.alphaH;
 				}
 				if(hw2){
-					var hp = ..gdip.pen(th.focusRing, 1.5);
-					graphics.drawRoundRect(hp, ..RECTF(hx2 - 1, hy2 - 1, hw2 + 2, hh2 + 2), 8);
+					// 渐变缓存使用整数像素尺寸，hover 也必须使用同一尺寸。
+					// 否则小数布局会让右/下边缘相差不足 1px，抗锯齿后露出缝隙。
+					var hoverW = floor(hw2 + 0.5);
+					var hoverH = floor(hh2 + 0.5);
+					if(hoverW < 2) hoverW = 2;
+					if(hoverH < 2) hoverH = 2;
+					var hoverR = 8;
+					if(hoverR > (hoverH - 1) / 2) hoverR = (hoverH - 1) / 2;
+					var hp = ..gdip.pen(th.focusRing, 2);
+					// 与内容边界共享同一条像素带：描边中心内缩 0.5px，
+					// 使 2px 描边的内沿覆盖内容边缘，不在右下留下抗锯齿缝。
+					graphics.drawRoundRect(hp, ..RECTF(hx2 + 0.5, hy2 + 0.5, hoverW - 1, hoverH - 1), hoverR);
 					hp.delete();
 				}
 			}
